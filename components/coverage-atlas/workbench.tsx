@@ -129,8 +129,8 @@ export function Workbench() {
             Live-scraped, not curated
           </div>
           <p className="text-[11px] leading-4 text-muted-foreground">
-            Every record was read from a public source by a scanner run and carries its citation. Verify against the
-            state's official publication before acting.
+            Every record carries the source it was read from. Verify against the state's official publication before
+            acting.
           </p>
         </div>
       </aside>
