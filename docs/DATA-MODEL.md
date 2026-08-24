@@ -11,6 +11,8 @@ number reproducible from `data/` alone.
 - [Friction flags](#friction-flags)
 - [The Access Friction Index](#the-access-friction-index)
 - [CoverageRecord](#coveragerecord)
+- [PolicyVersion and history](#policyversion-and-history)
+- [Gaps](#gaps)
 - [ChangeEvent](#changeevent)
 - [ConditionSpec](#conditionspec)
 - [RunLedger](#runledger)
@@ -109,9 +111,60 @@ One jurisdiction, one condition, one scan. The full field list is in
 | `criteriaVerbatim` | Exact characters from the source, or `null`. Never paraphrase into this field — the compare view aligns two states' original wording, and a blurred quote defeats the view. |
 | `sourceDoc` / `sourceUrl` | The citation. Every record carries one or explains why it does not. |
 | `confidence` | `high` \| `moderate` \| `review_needed`. Baseline-only records are knocked down a notch when the state's own publication did not corroborate them. |
-| `method` | Which ladder rung produced this: `baseline` \| `search` \| `fetch` \| `agent` \| `carried_forward`. Surfaced in the drawer, because how we know something is part of what we know. |
+| `method` | Which ladder rung produced this: `baseline` \| `search` \| `fetch` \| `agent` \| `backfill` \| `carried_forward` \| `inferred`. Surfaced in the drawer, because how we know something is part of what we know. **`inferred` is the only value with no source behind it** — see [Gaps](#gaps). |
+| `documentDate` | When the source document was published or last revised. Distinct from `effectiveDate`, and often the only date a document actually gives. |
+| `history` | Dated versions of this state's policy, oldest first. See below. |
 | `lastCheckedAt` | When our scanner last confirmed it. Distinct from `effectiveDate`, which is the policy's own date. |
 | `evidenceHash` | sha256 (truncated) of the windowed evidence. Equal hash across scans ⇒ zero tokens. |
+
+## PolicyVersion and history
+
+A state's policy has a history, and that history is usually visible in the
+documents themselves: a bulletin announcing a change states what the rule was
+before it, a superseded preferred drug list carries its own effective date. A
+scanner that only records "what is true now" throws that away and has to wait for
+its own second scan before it can say anything about change at all.
+
+So extraction asks for dated versions, and each one lands as a `PolicyVersion`:
+
+| Field | Notes |
+|---|---|
+| `status`, `authorization`, `frictionFlags`, `frictionIndex` | The same vocabulary as a record, so versions are directly comparable |
+| `effectiveDate` | When this version took effect |
+| `documentDate` | When the document stating it was published |
+| `criteriaVerbatim` | The wording *at that version* — how a rewrite becomes visible as a rewrite |
+| `isCurrent` | True for the version believed to be in force today |
+
+`sortHistory` orders chronologically and drops duplicates keyed on
+(date, status, flags), so re-reading the same bulletin from two sources does not
+double the timeline.
+
+`changesFromHistory` walks each state's versions and diffs adjacent pairs, using
+the same status-rank and 6-point friction rules as the snapshot differ. Events
+come out marked `historical`.
+
+## Gaps
+
+`gapsFor(record)` is the scan's to-do list and its stop condition in one
+function:
+
+| Gap | Raised when |
+|---|---|
+| `no_policy_found` | Status is `unpublished` |
+| `no_source` | No `sourceUrl` |
+| `no_timestamp` | Neither `effectiveDate` nor `documentDate` |
+| `no_criteria` | Neither `criteriaVerbatim` nor `criteriaSummary` |
+
+The backfill pass works this list worst-first (`prioritiseGaps`); the
+orchestrator finishes early when it comes back empty for every jurisdiction.
+
+An *absence of history* is deliberately **not** a blocking gap. Plenty of states
+simply have not changed their policy, and treating that as a hole would spend the
+whole budget chasing something that does not exist.
+
+Anything still carrying `no_policy_found` when the budget closes is filled by the
+inference pass and marked `method: "inferred"`, `confidence: "review_needed"`,
+with no source URL and a note saying what the estimate rests on.
 
 ## ChangeEvent
 
@@ -119,13 +172,14 @@ One jurisdiction, one condition, one scan. The full field list is in
 |---|---|
 | `direction` | `coverage_added` \| `coverage_dropped` \| `loosened` \| `tightened` \| `clarified` \| `stable` |
 | `frictionDelta` | Signed. Negative means easier to obtain. |
-| `provenance` | **`observed`** — our own snapshot differ caught it. **`reported`** — a dated public source stated it. |
+| `provenance` | **`observed`** — our own snapshot differ caught it between two scans. **`historical`** — we read two dated versions of the state's own policy and compared them. **`reported`** — a dated public announcement said so. |
 | `announcedOn` / `effectiveOn` | Announcement date and the date it bites. Often different, and the gap matters to a provider. |
 | `id` | `state-direction-date`. Re-scans update rather than duplicate. |
 
-`provenance` is surfaced in the UI on every event. "We watched this happen" and
-"we read that this happened" are different claims and users should never have to
-guess which one they are looking at.
+`provenance` is surfaced in the UI on every event. "We watched this happen", "we
+compared two dated versions of the policy", and "we read that this happened" are
+three different strengths of claim, and users should never have to guess which
+one they are looking at.
 
 ## ConditionSpec
 
@@ -153,6 +207,13 @@ scan console.
 | `statesShortCircuited` | Evidence hash unchanged — free |
 | `statesEscalated` | Needed a stealth browser |
 | `naivePromptTokensEstimate` | Counterfactual: every fetched document sent to a model once per state |
+| `statesBackfilled` | Gaps closed by following banked leads |
+| `statesInferred` | Filled from model knowledge after the budget closed |
+| `historicalChanges` | Change events derived from dated versions inside this one scan |
+| `budget` | `{tinyfishCalls, maxTinyfishCalls, steps, maxSteps, stoppedBecause}` |
+
+`budget.stoppedBecause` is `complete` (every jurisdiction answered, budget left
+unspent), `call_cap`, or `step_cap`.
 
 `naivePromptTokensEstimate ÷ promptTokens` is the savings ratio the UI reports.
 

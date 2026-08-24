@@ -61,7 +61,8 @@ flowchart TB
 
     subgraph agent["Collection agent"]
         ORCH["orchestrator.ts<br/><i>plan · budget · merge · ledger</i>"]
-        PH["phases/<br/><i>resolve · discover · baseline · subagent · changes</i>"]
+        PH["phases/<br/><i>resolve · discover · baseline · subagent · backfill · changes</i>"]
+        BUD["lib/budget.ts · lib/leads.ts<br/><i>ceilings · lead pool</i>"]
         DER["lib/derive.ts<br/><i>windowing · friction · outliers · differ</i>"]
     end
 
@@ -85,6 +86,8 @@ flowchart TB
     RV --> PH
     CLI --> ORCH
     ORCH --> PH --> DER
+    ORCH --> BUD
+    PH --> BUD
     ORCH --> store
     PH --> TF
     PH --> OR
@@ -129,22 +132,32 @@ sequenceDiagram
     O->>T: fetch top trackers
     O->>M: normalise one tracker → up to 51 rows (smart, ×1)
     O-->>U: plan {fromBaseline, toFanOut}
-    loop waves of 5
-        O->>S: {state, spec, baseline row, prior record}
+    loop waves of 5, while budget allows
+        O->>S: {state, spec, baseline row, prior record, budget, leads}
         S->>T: search → state's own policy document
-        S->>T: fetch → markdown
+        S->>T: fetch → markdown (+ outbound links banked as leads)
         Note over S: window to passages naming the drug;<br/>hash unchanged ⇒ carry forward, 0 tokens
         alt fetch blocked (403)
             S->>T: agent (stealth + US proxy) — metered, budgeted
         else evidence in hand
-            S->>M: extract criteria (cheap, ×1)
+            S->>M: extract criteria + dated versions (cheap, ×1)
         end
-        S-->>O: CoverageRecord
+        S-->>O: CoverageRecord (with history)
         O-->>U: state {record, done, total}
+    end
+    loop backfill rounds, while gaps remain and budget allows
+        O->>T: one batched fetch — 10 banked leads across 10 states
+        O->>M: extract into the gaps (cheap, ×n)
+        O-->>U: state {record} — revised in place
+    end
+    alt every jurisdiction answered
+        Note over O: stop early, budget unspent
+    else ceiling bound with states unresolved
+        O->>M: infer remaining (smart, ×1) — marked unverified
     end
     O->>T: news search — dated announcements
     O->>M: normalise reported changes (smart, ×1)
-    O->>O: diff previous snapshot vs this one
+    O->>O: diff previous snapshot · diff dated versions within this scan
     O->>D: write snapshot · merge changes · append ledger
     O-->>U: complete {ledger, outliers}
 ```
@@ -159,6 +172,10 @@ If the viewer navigates away mid-scan the stream closes but the scan continues
 headless. It is writing a snapshot either way, and a half-written scan is worse
 than one nobody watched.
 
+The whole run is bounded by two ceilings — 200 TinyFish calls and 80 orchestrator
+steps — and stops early, before either binds, once every jurisdiction carries a
+timestamped, cited answer. See [AGENT.md](AGENT.md#budgets-and-termination).
+
 ## Module boundaries
 
 | Module | Owns | Must not |
@@ -168,7 +185,10 @@ than one nobody watched.
 | `agent/phases/discover.ts` | Finding and ranking sources | Read policy substance |
 | `agent/phases/baseline.ts` | One multi-state read → many rows | Fan out, or hold per-state state |
 | `agent/phases/subagent.ts` | One state, the escalation ladder, one record | See another state, the tracker document, or the orchestrator's reasoning |
-| `agent/phases/changes.ts` | Dated public announcements | Compute observed deltas |
+| `agent/phases/backfill.ts` | Closing gaps by following banked leads; the post-cap inference pass | Re-do work the fan-out already did well |
+| `agent/phases/changes.ts` | Dated public announcements | Compute observed or historical deltas |
+| `agent/lib/budget.ts` | The two ceilings and the stop reason | Know what it is bounding |
+| `agent/lib/leads.ts` | Ranking and dedup of candidate URLs across the run | Fetch anything itself |
 | `agent/lib/derive.ts` | Windowing, friction, outliers, the differ | Perform I/O or call a model |
 | `agent/lib/tinyfish.ts` | The three primitives, retries, SSE parsing | Know what a condition is |
 | `agent/lib/llm.ts` | OpenRouter, tier routing, the token ledger | Know what a state is |
@@ -190,12 +210,20 @@ Every number in the product falls on one side of this line, and the split is the
 main reason the output can be defended:
 
 **Extraction** is anything a model states about a jurisdiction: coverage status,
-which gates the document describes, verbatim criteria, effective dates. It comes
+which gates the document describes, verbatim criteria, effective and document
+dates, and any dated earlier or later version the document describes. It comes
 from a source, carries a URL and a document title, and is stamped with a
 confidence and the ladder rung that produced it. A subagent that cannot find
 evidence returns `unpublished` rather than a guess — "no published
 fee-for-service policy" is a real and reportable finding, and several states
 genuinely leave this to their managed-care plans.
+
+There is exactly one exception, and it is fenced off: when the budget closes with
+jurisdictions still unresolved, a final pass fills them from the model's own
+knowledge as `method: "inferred"`, with no source URL, `review_needed`
+confidence, and a note saying so. The interface marks these everywhere they
+appear. An honest low-confidence cell beats a hole, but only if it is never
+mistaken for a sourced one.
 
 **Derivation** is anything Coverage Atlas asserts *across* jurisdictions:
 friction scores, peer outliers, spread within a status, the delta. This is
@@ -226,6 +254,9 @@ Degradation is per-state and per-rung, never global.
   exponentially; a 4xx will not fix itself and fails immediately. A model that
   returns prose instead of JSON twice is one we stop paying for rather than one
   we keep coaxing.
+- **Running out of budget is a normal ending, not an error.** Both ceilings are
+  checked before spending, never after, and a phase that cannot afford its whole
+  batch skips it rather than spending part of it.
 - **A changed status is an alert, so borderline calls are sticky.** The
   baseline prompt is given the statuses we already hold and instructed to keep
   them unless the document plainly contradicts them, and the differ ignores

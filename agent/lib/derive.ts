@@ -14,6 +14,8 @@ import {
   type CoverageRecord,
   type CoverageStatus,
   type FrictionFlag,
+  type PolicyVersion,
+  type RecordGap,
 } from "./types"
 
 export function sha256(text: string): string {
@@ -262,4 +264,148 @@ export function diffSnapshots(
   }
 
   return events.sort((a, b) => Math.abs(b.frictionDelta) - Math.abs(a.frictionDelta))
+}
+
+
+/* ------------------------------------------------------------------- gaps */
+
+/**
+ * What a record is still missing.
+ *
+ * This is the scan's to-do list and its stop condition in one function. The
+ * orchestrator backfills against it and finishes early when it comes back empty
+ * for every jurisdiction — at which point there is genuinely nothing left worth
+ * spending a call on.
+ *
+ * `no_history` is deliberately not counted as a blocking gap for a state we have
+ * otherwise answered well: plenty of states simply have not changed their policy,
+ * and an absence of history is a legitimate finding rather than a hole.
+ */
+export function gapsFor(record: CoverageRecord): RecordGap[] {
+  const gaps: RecordGap[] = []
+  if (record.status === "unpublished") gaps.push("no_policy_found")
+  if (!record.sourceUrl) gaps.push("no_source")
+  if (!record.effectiveDate && !record.documentDate) gaps.push("no_timestamp")
+  if (!record.criteriaVerbatim && !record.criteriaSummary) gaps.push("no_criteria")
+  return gaps
+}
+
+/** Blocking gaps only — what the stop condition actually waits on. */
+export function isRecordComplete(record: CoverageRecord): boolean {
+  return gapsFor(record).length === 0
+}
+
+/** Worst-first, so a limited budget is spent where it changes the map most. */
+export function prioritiseGaps(records: CoverageRecord[]): CoverageRecord[] {
+  const weight = (r: CoverageRecord) => {
+    const gaps = gapsFor(r)
+    return (
+      (gaps.includes("no_policy_found") ? 100 : 0) +
+      (gaps.includes("no_source") ? 40 : 0) +
+      (gaps.includes("no_timestamp") ? 25 : 0) +
+      (gaps.includes("no_criteria") ? 15 : 0)
+    )
+  }
+  return records.filter((r) => gapsFor(r).length > 0).sort((a, b) => weight(b) - weight(a))
+}
+
+/* ---------------------------------------------------------------- history */
+
+/** Chronological, current version last, one entry per (effective date, status). */
+export function sortHistory(versions: PolicyVersion[]): PolicyVersion[] {
+  const key = (v: PolicyVersion) => v.effectiveDate ?? v.documentDate ?? ""
+  const seen = new Set<string>()
+  return versions
+    .filter((v) => {
+      const id = `${key(v)}|${v.status}|${v.frictionFlags.slice().sort().join(",")}`
+      if (seen.has(id)) return false
+      seen.add(id)
+      return true
+    })
+    .sort((a, b) => key(a).localeCompare(key(b)))
+}
+
+/**
+ * Change events derived from dated versions found inside a single scan.
+ *
+ * This is what lets a first scan say anything about change at all. Medicaid
+ * publishes no change feed, but its documents are full of dated self-reference —
+ * a bulletin announcing a new rule states the old one, a superseded drug list
+ * carries the date it stopped applying. Walking a state's versions in order and
+ * diffing adjacent pairs turns that into a timeline.
+ *
+ * Marked `historical` rather than `observed`: we read two dated versions of the
+ * state's own policy and compared them, which is a stronger claim than a news
+ * headline and a weaker one than having watched it change ourselves.
+ */
+export function changesFromHistory(records: CoverageRecord[], detectedAt: string): ChangeEvent[] {
+  const events: ChangeEvent[] = []
+
+  for (const record of records) {
+    const history = sortHistory(record.history ?? [])
+    if (history.length < 2) continue
+
+    for (let i = 1; i < history.length; i++) {
+      const was = history[i - 1]
+      const now = history[i]
+      const frictionDelta = now.frictionIndex - was.frictionIndex
+      if (was.status === now.status && Math.abs(frictionDelta) < 6) continue
+
+      const rankDelta = STATUS_RANK[now.status] - STATUS_RANK[was.status]
+      let direction: ChangeEvent["direction"]
+      let headline: string
+      if (STATUS_RANK[was.status] > 1 && STATUS_RANK[now.status] <= 1) {
+        direction = "coverage_dropped"
+        headline = `${record.stateName} ended its coverage pathway`
+      } else if (STATUS_RANK[was.status] <= 1 && STATUS_RANK[now.status] > 1) {
+        direction = "coverage_added"
+        headline = `${record.stateName} opened a coverage pathway`
+      } else if (frictionDelta < 0 || rankDelta > 0) {
+        direction = "loosened"
+        headline = `${record.stateName} eased access by ${Math.abs(frictionDelta)} friction points`
+      } else {
+        direction = "tightened"
+        headline = `${record.stateName} tightened access by ${frictionDelta} friction points`
+      }
+
+      const gained = now.frictionFlags.filter((f) => !was.frictionFlags.includes(f))
+      const lost = was.frictionFlags.filter((f) => !now.frictionFlags.includes(f))
+      const when = now.effectiveDate ?? now.documentDate ?? detectedAt.slice(0, 10)
+
+      events.push({
+        id: `${record.state}-${direction}-${when}`,
+        state: record.state,
+        stateName: record.stateName,
+        direction,
+        headline,
+        detail: [
+          was.status !== now.status
+            ? `Status moved from ${was.status.replace(/_/g, " ")} to ${now.status.replace(/_/g, " ")}.`
+            : null,
+          gained.length ? `Added: ${gained.join(", ").replace(/_/g, " ")}.` : null,
+          lost.length ? `Removed: ${lost.join(", ").replace(/_/g, " ")}.` : null,
+          was.criteriaVerbatim && now.criteriaVerbatim ? `Criteria language was rewritten.` : null,
+        ]
+          .filter(Boolean)
+          .join(" ") || null,
+        fromStatus: was.status,
+        toStatus: now.status,
+        frictionDelta,
+        announcedOn: now.documentDate ?? when,
+        effectiveOn: now.effectiveDate,
+        sourceDoc: now.sourceDoc,
+        sourceUrl: now.sourceUrl,
+        provenance: "historical",
+        detectedAt,
+      })
+    }
+  }
+
+  return events.sort((a, b) => (b.announcedOn ?? "").localeCompare(a.announcedOn ?? ""))
+}
+
+/** The dated versions behind one state, newest first — what the compare view shows. */
+export function historyFor(record: CoverageRecord | undefined): PolicyVersion[] {
+  if (!record) return []
+  return sortHistory(record.history ?? []).reverse()
 }

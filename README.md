@@ -71,10 +71,12 @@ Every change event says which of these it is, because they are very different
 claims:
 
 - **Observed** — our own snapshot differ. Ground truth: we held the same fifty
-  sources at two points in time and compared them. Medicaid has no change feed,
-  so this is the only way the delta exists at all.
-- **Reported** — a dated public announcement, found by search. The only way a
-  *first* scan can show history.
+  sources at two points in time and compared them.
+- **Historical** — two dated versions of the state's *own* policy, read during
+  one scan and compared. Medicaid documents are full of dated self-reference: a
+  bulletin announcing a change states the rule it replaces. This is what lets a
+  **first** scan show a timeline rather than a flat snapshot.
+- **Reported** — a dated public announcement, found by news search.
 
 Snapshots are immutable files. Every scan appends one; the differ reads two. The
 "view date" control resolves to the newest snapshot at or before that date, so
@@ -89,10 +91,15 @@ subagents that own nothing else. The orchestrator does no extraction; the
 subagents see no context beyond their own state.
 
 ```
-resolve → discover → baseline → fan-out (waves of 5) → changes → diff → snapshot
-  smart     search      fetch      search→fetch→agent     search    pure    disk
-   ×1        ×4        ×1 + smart      cheap ×n           smart×1    code
+resolve → discover → baseline → fan-out → backfill → [infer] → changes → diff → snapshot
+  smart     search      fetch     ladder    leads +    on cap    search    pure    disk
+   ×1        ×4        ×1+smart   cheap×n   batched              smart×1   code
+                                            fetch
 ```
+
+Bounded by two hard ceilings — **200 TinyFish calls** and **80 orchestrator
+steps** — and it stops early, budget unspent, once every jurisdiction carries a
+timestamped, cited answer.
 
 **Phase 0 · Resolve** — one smart-model call turns free text ("Ozempic", "kids
 with autism") into a condition, the treatment class states write policy about,
@@ -116,8 +123,15 @@ ladder and stops at the first rung that answers:
 | 2. fetch | free | Pull it as markdown, window it to the passages naming the drug |
 | 3. agent (stealth) | metered | Only when fetch 403s — many state portals do |
 
+**Phase 3b · Backfill** — the tail. States with no policy found, no citation, no
+date or no criteria language go back into the queue, worst first. Every URL the
+scan did not read was banked as a lead — search results it skipped, and outbound
+links from every page it fetched — and ten states' leads go out in **one** batched
+fetch. Queries here ask "when did it change?" rather than "what is the rule?",
+because a dated bulletin answers both.
+
 **Phase 4 · Changes** — dated announcements via news search, plus the snapshot
-diff.
+diff, plus the dated versions found inside this scan's own documents.
 
 **Phase 5 · Derive** — friction, outliers, deltas. Pure arithmetic over stored
 citations, reproducible without calling a model at all.
@@ -226,6 +240,10 @@ pnpm agent:ledger                                            # cost history
 | `standard` | states the baseline left thin | 1–3 min | The normal scan |
 | `deep` | all 51 | 5–10 min | Best verbatim coverage, most spend |
 
+Ceilings are `--max-calls 200` and `--max-steps 80`. Anything still unresolved
+when they bind is filled from model knowledge and marked **unverified** — never
+presented as sourced.
+
 Full setup, tuning and troubleshooting: [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ## Layout
@@ -237,14 +255,17 @@ agent/
   lib/
     tinyfish.ts         search / fetch / agent, retries and SSE parsing
     llm.ts              OpenRouter, two-tier routing, token ledger
-    derive.ts           windowing, friction index, outliers, snapshot differ
+    derive.ts           windowing, friction index, outliers, gaps, differs
+    budget.ts           the two ceilings and the stop condition
+    leads.ts            scored, deduplicated pool of URLs worth reading next
     store.ts            immutable JSON snapshots on disk
     types.ts            the contract the UI and the collector share
   phases/
     resolve.ts          free text → scan target
     discover.ts         source discovery and ranking
     baseline.ts         one read, fifty answers
-    subagent.ts         per-state worker, escalation ladder
+    subagent.ts         per-state worker, escalation ladder, dated versions
+    backfill.ts         gap closing via banked leads; post-cap inference
     changes.ts          dated public announcements
 app/api/                atlas · changes · conditions · scan (SSE) · verify (SSE)
 components/coverage-atlas/

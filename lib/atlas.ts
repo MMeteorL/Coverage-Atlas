@@ -10,11 +10,12 @@ import type {
   CoverageStatus,
   DiscoveredSource,
   FrictionFlag,
+  PolicyVersion,
   RunLedger,
 } from "@/agent/lib/types"
 import { FRICTION_LABELS, PEER_OF } from "@/agent/lib/types"
 
-export type { ChangeEvent, ConditionSpec, CoverageRecord, CoverageStatus, DiscoveredSource, FrictionFlag, RunLedger }
+export type { ChangeEvent, ConditionSpec, CoverageRecord, CoverageStatus, DiscoveredSource, FrictionFlag, PolicyVersion, RunLedger }
 export { FRICTION_LABELS, PEER_OF }
 
 export type ConditionSummary = ConditionSpec & {
@@ -37,7 +38,7 @@ export type AtlasPayload = {
 export type ChangesPayload = {
   days: number
   events: (ChangeEvent & { currentStatus: CoverageStatus | null })[]
-  summary: { total: number; widened: number; tightened: number; observed: number; reported: number }
+  summary: { total: number; widened: number; tightened: number; observed: number; historical: number; reported: number }
 }
 
 export const STATUS_LABEL: Record<CoverageStatus, string> = {
@@ -73,7 +74,20 @@ export const METHOD_LABEL: Record<CoverageRecord["method"], string> = {
   search: "Search only",
   fetch: "State document (fetch)",
   agent: "Browser agent (stealth)",
+  backfill: "State document (followed lead)",
   carried_forward: "Unchanged since last scan",
+  inferred: "Inferred — not verified",
+}
+
+/** The one method with no source behind it. The UI must always mark it. */
+export function isInferred(record: CoverageRecord): boolean {
+  return record.method === "inferred"
+}
+
+export const PROVENANCE_LABEL: Record<ChangeEvent["provenance"], string> = {
+  observed: "Observed by our scanner",
+  historical: "From dated policy versions",
+  reported: "Publicly reported",
 }
 
 export const DIRECTION_LABEL: Record<ChangeEvent["direction"], string> = {

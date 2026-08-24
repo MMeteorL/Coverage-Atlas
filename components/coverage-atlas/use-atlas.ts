@@ -1,7 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import type { AtlasPayload, ChangesPayload, ConditionSummary, CoverageRecord } from "@/lib/atlas"
+import type { AtlasPayload, ChangesPayload, ConditionSpec, ConditionSummary, CoverageRecord } from "@/lib/atlas"
 
 async function getJson<T>(url: string): Promise<T> {
   const res = await fetch(url, { cache: "no-store" })
@@ -66,25 +66,52 @@ export type ScanPhase = { phase: string; note: string; at: number }
 export type ScanState = {
   running: boolean
   condition: string | null
+  /** The condition the scanner resolved the query to — drives the header sync. */
+  resolved: ConditionSpec | null
   phases: ScanPhase[]
+  /** The one line worth reading right now: what the agent is doing this second. */
+  currentTask: string | null
+  currentPhase: string | null
   /** Records as they land, so the map repaints jurisdiction by jurisdiction. */
   live: Map<string, CoverageRecord>
   done: number
   total: number
   plan: { fromBaseline: number; toFanOut: number } | null
+  budget: { tinyfishCalls: number; maxTinyfishCalls: number; steps: number; maxSteps: number } | null
   ledger: AtlasPayload["ledger"] | null
   outliers: AtlasPayload["outliers"]
   error: string | null
 }
 
+/** Human phrasing for each phase, used by the one-line progress indicator. */
+const PHASE_VERB: Record<string, string> = {
+  resolve: "Working out what to scan",
+  discover: "Finding policy sources",
+  baseline: "Reading multi-state trackers",
+  plan: "Planning the sweep",
+  fanout: "Reading state policy documents",
+  backfill: "Chasing down missing information",
+  infer: "Filling what could not be sourced",
+  changes: "Working out what changed",
+}
+
+export function phaseLabel(phase: string | null): string {
+  if (!phase) return "Starting up"
+  return PHASE_VERB[phase] ?? phase
+}
+
 const EMPTY_SCAN: ScanState = {
   running: false,
   condition: null,
+  resolved: null,
   phases: [],
+  currentTask: null,
+  currentPhase: null,
   live: new Map(),
   done: 0,
   total: 51,
   plan: null,
+  budget: null,
   ledger: null,
   outliers: [],
   error: null,
@@ -106,7 +133,7 @@ export function useScan(onFinished: () => void) {
       abortRef.current?.abort()
       const controller = new AbortController()
       abortRef.current = controller
-      setScan({ ...EMPTY_SCAN, running: true, condition, live: new Map() })
+      setScan({ ...EMPTY_SCAN, running: true, condition, live: new Map(), currentTask: `Interpreting "${condition}"` })
 
       try {
         const res = await fetch("/api/scan", {
@@ -172,7 +199,24 @@ function reduce(prev: ScanState, event: Record<string, unknown>): ScanState {
     case "phase":
       return {
         ...prev,
-        phases: [...prev.phases.slice(-60), { phase: String(event.phase), note: String(event.note), at: Date.now() }],
+        currentPhase: String(event.phase),
+        currentTask: String(event.note),
+        // The full log is kept for the side panel; only the tail is retained,
+        // because a deep scan emits hundreds of lines and none of the early ones
+        // matter once the map has moved on.
+        phases: [...prev.phases.slice(-400), { phase: String(event.phase), note: String(event.note), at: Date.now() }],
+      }
+    case "condition":
+      return { ...prev, resolved: event.spec as ConditionSpec }
+    case "budget":
+      return {
+        ...prev,
+        budget: {
+          tinyfishCalls: Number(event.tinyfishCalls),
+          maxTinyfishCalls: Number(event.maxTinyfishCalls),
+          steps: Number(event.steps),
+          maxSteps: Number(event.maxSteps),
+        },
       }
     case "plan":
       return {
@@ -184,29 +228,30 @@ function reduce(prev: ScanState, event: Record<string, unknown>): ScanState {
       const record = event.record as CoverageRecord
       const live = new Map(prev.live)
       live.set(record.state, record)
-      return { ...prev, live, done: Number(event.done), total: Number(event.total) }
-    }
-    case "changes":
       return {
         ...prev,
-        phases: [
-          ...prev.phases,
-          {
-            phase: "changes",
-            note: `${event.observed} observed by snapshot diff, ${event.reported} reported publicly`,
-            at: Date.now(),
-          },
-        ],
+        live,
+        done: Number(event.done),
+        total: Number(event.total),
+        currentTask: `${record.stateName} — ${record.status.replace(/_/g, " ")}`,
       }
+    }
+    case "changes": {
+      const note =
+        `${event.observed} observed by snapshot diff, ${event.historical} from dated versions found in this scan, ` +
+        `${event.reported} reported publicly`
+      return { ...prev, currentTask: note, phases: [...prev.phases, { phase: "changes", note, at: Date.now() }] }
+    }
     case "complete":
       return {
         ...prev,
         running: false,
+        currentTask: null,
         ledger: event.ledger as ScanState["ledger"],
         outliers: (event.outliers ?? []) as ScanState["outliers"],
       }
     case "error":
-      return { ...prev, running: false, error: String(event.message) }
+      return { ...prev, running: false, currentTask: null, error: String(event.message) }
     default:
       return prev
   }

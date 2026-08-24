@@ -15,6 +15,7 @@ import { askJson } from "../lib/llm"
 import { fetchContents } from "../lib/tinyfish"
 import { estimateTokens, sha256 } from "../lib/derive"
 import { STATE_NAMES, type ConditionSpec, type CoverageRecord, type DiscoveredSource } from "../lib/types"
+import type { Budget } from "../lib/budget"
 
 const STATUSES = ["covered", "conditional", "limited", "not_covered", "unpublished"] as const
 const FLAGS = [
@@ -65,12 +66,13 @@ export async function buildBaseline(
   spec: ConditionSpec,
   sources: DiscoveredSource[],
   prior: CoverageRecord[],
+  budget: Budget,
   onProgress?: (note: string) => void,
 ): Promise<{ rows: Map<string, BaselineRow>; used: DiscoveredSource[]; fetches: number; naiveTokens: number }> {
   const multiState = sources.filter((s) => s.statesAddressed >= 8).slice(0, 3)
   const rows = new Map<string, BaselineRow>()
-  if (multiState.length === 0) {
-    onProgress?.("no multi-state tracker found — every state goes to the fan-out")
+  if (multiState.length === 0 || !budget.spendCalls(1)) {
+    onProgress?.("no multi-state tracker available — every state goes to the fan-out")
     return { rows, used: [], fetches: 0, naiveTokens: 0 }
   }
 

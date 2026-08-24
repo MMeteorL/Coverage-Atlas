@@ -96,9 +96,11 @@ pnpm agent:ledger     # cost history across recent runs
 | Flag | Default | Effect |
 |---|---|---|
 | `--depth` | `standard` | `baseline` \| `standard` \| `deep` |
+| `--max-calls` | `200` | Hard ceiling on all TinyFish calls |
+| `--max-steps` | `80` | Hard ceiling on orchestrator work items |
 | `--agent-budget` | `6` | Ceiling on metered stealth browser runs |
 | `--wave` | `5` | Subagents in flight |
-| `--change-window` | `180` | Days back the news search looks |
+| `--change-window` | `365` | Days back the news search looks |
 
 States print as coloured status marks as they land, then the outliers, then the
 ledger.
@@ -130,6 +132,10 @@ tokens and TinyFish agent runs.
   the volume; the smart tier is 3–4 calls.
 - **Raising `--wave` past your TinyFish plan's concurrency limit** produces
   throttling, not speed.
+- **The ceilings are the real safety net.** `--max-calls 200` and
+  `--max-steps 80` bound every run. Lowering them is the fastest way to cap a
+  scan's cost; the trade is more states finishing as `inferred` rather than
+  sourced.
 
 Check what any given run actually cost with `pnpm agent:ledger`.
 
@@ -158,12 +164,28 @@ boot.
 **`no snapshot yet` in the atlas**
 The condition exists but has never been scanned. Press Run scan.
 
-**A scan reports many `unpublished` states**
-Usually means source discovery found no good multi-state tracker for that
-condition, so nearly every state fell through to the fan-out and several found
-nothing. Try `--depth deep`, or rephrase the condition toward the term policy
+**A scan reports many `unpublished` or `inferred` states**
+Check the last line of the ledger for `stopped because`. If it says a ceiling was
+reached, raise `--max-calls` / `--max-steps` — the backfill pass ran out of room
+before it could close the gaps. If it says every jurisdiction was answered, then
+source discovery found no good multi-state tracker and the states genuinely
+publish nothing findable; try `--depth deep`, or rephrase toward the term policy
 documents actually use — "continuous glucose monitors" rather than "diabetes
-gadgets". Check the `discover` lines in the log to see what it found.
+gadgets". The `discover` and `backfill` lines in the log show what it found and
+what it chased.
+
+**A state shows "unverified"**
+That record is `method: "inferred"` — the budget closed before the scan could
+reach a source for it, so it is the model's best understanding, not a reading.
+Re-run with higher ceilings, or open the state and press **Check again now**,
+which runs a fresh ladder against its own source.
+
+**The changes page is empty**
+A first scan has no prior snapshot to diff against, so it depends on dated
+versions found inside documents (`historical`) and on public announcements
+(`reported`). If a condition's sources are all undated current-state pages, there
+is nothing to build a timeline from until the second scan. Re-scan to get
+`observed` deltas.
 
 **A state's record looks wrong**
 Open it and press **Check again now**. If the live re-read disagrees, the record

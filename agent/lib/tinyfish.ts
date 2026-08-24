@@ -30,6 +30,22 @@ export type FetchResult = {
   links?: string[]
 }
 
+/** Anything that reads like a date the source is asserting about itself. */
+export function guessDocumentDate(doc: Pick<FetchResult, "text" | "title" | "url">): string | null {
+  const haystack = `${doc.title ?? ""} ${doc.url ?? ""} ${(doc.text ?? "").slice(0, 4000)}`
+  const iso = haystack.match(/\b(20[23]\d)-(\d{2})-(\d{2})\b/)
+  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`
+  const months = "january|february|march|april|may|june|july|august|september|october|november|december"
+  const written = haystack.match(new RegExp(`\\b(${months})\\s+(\\d{1,2}),?\\s+(20[23]\\d)\\b`, "i"))
+  if (written) {
+    const month = months.split("|").indexOf(written[1].toLowerCase()) + 1
+    return `${written[3]}-${String(month).padStart(2, "0")}-${written[2].padStart(2, "0")}`
+  }
+  const numeric = haystack.match(/\b(\d{1,2})[./](\d{1,2})[./](20[23]\d)\b/)
+  if (numeric) return `${numeric[3]}-${numeric[1].padStart(2, "0")}-${numeric[2].padStart(2, "0")}`
+  return null
+}
+
 export type AgentEvent = {
   type: "STARTED" | "STREAMING_URL" | "PROGRESS" | "COMPLETE" | string
   run_id?: string
@@ -102,7 +118,10 @@ export async function fetchContents(urls: string[], timeoutMs = 90_000): Promise
     const res = await fetch(FETCH_URL, {
       method: "POST",
       headers: { "X-API-Key": apiKey(), "Content-Type": "application/json" },
-      body: JSON.stringify({ urls: urls.slice(0, 10), format: "markdown", links: false }),
+      // Links are requested because outbound links are leads: a state's
+      // preferred-drug-list landing page rarely names a drug, but it links to
+      // the dated PDF that does.
+      body: JSON.stringify({ urls: urls.slice(0, 10), format: "markdown", links: true }),
       signal: AbortSignal.timeout(timeoutMs),
     })
     if (!res.ok) throw new TinyFishError(`fetch HTTP ${res.status}`, "HTTP_ERROR")

@@ -5,6 +5,7 @@
 //
 //   pnpm scan "GLP-1 drugs for weight loss"
 //   pnpm scan "continuous glucose monitors" --depth deep --agent-budget 10
+//   pnpm scan "hepatitis C antivirals" --max-calls 120 --max-steps 60
 //   pnpm scan glp1 --depth baseline          # rescan a saved condition, cheapest mode
 //   pnpm agent:list
 //   pnpm agent:ledger
@@ -46,7 +47,12 @@ async function cmdScan(condition: string) {
     depth,
     agentBudget: Number(arg("--agent-budget", "6")),
     waveSize: Number(arg("--wave", "5")),
-    changeWindowDays: Number(arg("--change-window", "180")),
+    changeWindowDays: Number(arg("--change-window", "365")),
+    limits: {
+      maxTinyfishCalls: Number(arg("--max-calls", "200")),
+      maxSteps: Number(arg("--max-steps", "80")),
+      maxAgentRuns: Number(arg("--agent-budget", "6")),
+    },
     onEvent: (event) => {
       switch (event.type) {
         case "phase":
@@ -65,8 +71,16 @@ async function cmdScan(condition: string) {
           }
           break
         }
+        case "budget":
+          if (event.tinyfishCalls > 0 && event.tinyfishCalls % 25 === 0) {
+            console.log(`${DIM}[budget]${RESET} ${event.tinyfishCalls}/${event.maxTinyfishCalls} calls · ${event.steps}/${event.maxSteps} steps`)
+          }
+          break
         case "changes":
-          console.log(`\n${BLUE}delta${RESET} ${event.observed} observed by snapshot diff · ${event.reported} reported publicly`)
+          console.log(
+            `\n${BLUE}delta${RESET} ${event.observed} observed by snapshot diff · ` +
+              `${event.historical} from dated versions found in this scan · ${event.reported} reported publicly`,
+          )
           break
         case "complete": {
           console.log(`\n${BOLD}What stands out${RESET}`)

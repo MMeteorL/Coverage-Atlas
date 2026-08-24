@@ -37,6 +37,7 @@ export async function GET(request: Request) {
       widened: ranked.filter((e) => e.direction === "coverage_added" || e.direction === "loosened").length,
       tightened: ranked.filter((e) => e.direction === "coverage_dropped" || e.direction === "tightened").length,
       observed: ranked.filter((e) => e.provenance === "observed").length,
+      historical: ranked.filter((e) => e.provenance === "historical").length,
       reported: ranked.filter((e) => e.provenance === "reported").length,
     },
   })

@@ -17,6 +17,7 @@
 
 import { askJson } from "../lib/llm"
 import { search } from "../lib/tinyfish"
+import type { Budget } from "../lib/budget"
 import { STATE_NAMES, type ChangeDirection, type ChangeEvent, type ConditionSpec } from "../lib/types"
 
 const SCHEMA = {
@@ -59,14 +60,21 @@ const DIRECTION_DELTA: Record<Exclude<ChangeDirection, "stable">, number> = {
 export async function discoverReportedChanges(
   spec: ConditionSpec,
   windowDays: number,
+  budget: Budget,
   onProgress?: (note: string) => void,
 ): Promise<{ events: ChangeEvent[]; searches: number }> {
   const after = new Date(Date.now() - windowDays * 86_400_000).toISOString().slice(0, 10)
-  const queries = [
+  const allQueries = [
     `state Medicaid ${spec.treatmentClass} coverage change announcement ${spec.name}`,
     `Medicaid ${spec.treatmentClass} prior authorization requirement added removed state bulletin`,
     `state Medicaid ends coverage ${spec.treatmentClass} ${spec.name} effective date`,
   ]
+  // Change discovery runs last, so it takes whatever the ceiling has left.
+  const queries = allQueries.slice(0, Math.min(allQueries.length, budget.callsLeft))
+  if (queries.length === 0 || !budget.spendCalls(queries.length)) {
+    onProgress?.("call ceiling reached before change discovery — relying on snapshot and history deltas")
+    return { events: [], searches: 0 }
+  }
 
   const batches = await Promise.allSettled(
     queries.map((q) => search(q, { domainType: "news", afterDate: after })),

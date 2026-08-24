@@ -61,6 +61,34 @@ export const FRICTION_LABELS: Record<FrictionFlag, string> = {
   age_restriction: "Age restriction",
 }
 
+/**
+ * One dated observation of a jurisdiction's policy.
+ *
+ * A state's policy has a history, and that history is usually visible in the
+ * documents themselves: a bulletin announcing a change states what the rule was
+ * before it, and a superseded preferred drug list carries its own effective
+ * date. A scanner that only records "what is true now" throws that away and has
+ * to wait for its own second scan before it can say anything about change at
+ * all. Recording dated versions means a single scan already carries the delta.
+ */
+export type PolicyVersion = {
+  status: CoverageStatus
+  authorization: AuthorizationGate
+  frictionFlags: FrictionFlag[]
+  frictionIndex: number
+  criteriaSummary: string | null
+  criteriaVerbatim: string | null
+  /** When this version of the policy took effect, per the source. */
+  effectiveDate: string | null
+  /** When the document stating it was published or last revised. */
+  documentDate: string | null
+  sourceDoc: string | null
+  sourceUrl: string | null
+  /** True for the version the scanner believes is in force today. */
+  isCurrent: boolean
+  discoveredAt: string
+}
+
 /** One jurisdiction's policy for one condition, as of one scan. */
 export type CoverageRecord = {
   state: string                  // 2-letter USPS, plus DC
@@ -82,13 +110,29 @@ export type CoverageRecord = {
   sourceUrl: string | null
   effectiveDate: string | null   // ISO date
   confidence: Confidence
-  /** How this record was obtained — the escalation ladder rung that produced it. */
-  method: "baseline" | "search" | "fetch" | "agent" | "carried_forward"
+  /**
+   * How this record was obtained — the escalation ladder rung that produced it.
+   * `inferred` is the only value not backed by a source document: it marks a
+   * record filled in from the model's own knowledge after the call budget was
+   * exhausted, and it always carries `review_needed` confidence.
+   */
+  method: "baseline" | "search" | "fetch" | "agent" | "backfill" | "carried_forward" | "inferred"
   lastCheckedAt: string          // ISO timestamp
+  /** When the source document itself was published or last revised. */
+  documentDate: string | null
+  /**
+   * Dated versions of this state's policy, oldest first, including the current
+   * one. Populated whenever a source states what the rule was before or after
+   * the version in force — the raw material for change events from a single scan.
+   */
+  history: PolicyVersion[]
   /** sha256 of the evidence window. Equal hash across scans => zero LLM tokens spent. */
   evidenceHash: string | null
   notes: string | null
 }
+
+/** What a record is still missing. Drives the backfill pass and the stop condition. */
+export type RecordGap = "no_policy_found" | "no_source" | "no_timestamp" | "no_criteria" | "no_history"
 
 export type ChangeDirection =
   | "coverage_added"
@@ -112,8 +156,13 @@ export type ChangeEvent = {
   effectiveOn: string | null
   sourceDoc: string | null
   sourceUrl: string | null
-  /** "observed" = our own snapshot diff caught it. "reported" = a dated public source stated it. */
-  provenance: "observed" | "reported"
+  /**
+   * How we know this happened, in descending order of directness:
+   *   observed   — our own snapshot differ caught it between two scans
+   *   historical — we read two dated versions of the state's own policy and compared them
+   *   reported   — a dated public announcement said so
+   */
+  provenance: "observed" | "historical" | "reported"
   detectedAt: string
 }
 
@@ -170,6 +219,20 @@ export type RunLedger = {
   statesEscalated: number
   /** Prompt tokens we would have spent with a naive per-state full-document loop. */
   naivePromptTokensEstimate: number
+  /** States whose gaps a targeted backfill round closed. */
+  statesBackfilled: number
+  /** States the model filled in from its own knowledge after the budget ran out. */
+  statesInferred: number
+  /** Change events derived from dated versions found within this single scan. */
+  historicalChanges: number
+  budget: {
+    tinyfishCalls: number
+    maxTinyfishCalls: number
+    steps: number
+    maxSteps: number
+    /** Why the scan stopped. */
+    stoppedBecause: "complete" | "call_cap" | "step_cap"
+  }
   errors: string[]
 }
 

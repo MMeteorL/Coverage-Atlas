@@ -22,8 +22,10 @@
 //      the orchestrator holds.
 
 import { askJson } from "../lib/llm"
-import { fetchContents, runAgent, search, unwrapAgentResult } from "../lib/tinyfish"
-import { estimateTokens, frictionIndex, sha256, windowText } from "../lib/derive"
+import { fetchContents, guessDocumentDate, runAgent, search, unwrapAgentResult } from "../lib/tinyfish"
+import { estimateTokens, frictionIndex, sha256, sortHistory, windowText } from "../lib/derive"
+import type { Budget } from "../lib/budget"
+import type { LeadPool } from "../lib/leads"
 import {
   STATE_FIPS,
   STATE_NAMES,
@@ -32,6 +34,7 @@ import {
   type CoverageRecord,
   type CoverageStatus,
   type FrictionFlag,
+  type PolicyVersion,
 } from "../lib/types"
 import type { BaselineRow } from "./baseline"
 
@@ -42,10 +45,25 @@ const FLAGS = [
   "medical_benefit_only", "age_restriction", "diagnosis_restriction",
 ] as const
 
+const VERSION_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["status", "frictionFlags", "effectiveDate", "note"],
+  properties: {
+    status: { type: "string", enum: STATUSES as unknown as string[] },
+    frictionFlags: { type: "array", items: { type: "string", enum: FLAGS as unknown as string[] } },
+    effectiveDate: { type: ["string", "null"], description: "ISO date this version took effect or stopped applying" },
+    note: { type: ["string", "null"], description: "What the excerpt says about this earlier or later version" },
+  },
+} as const
+
 const EXTRACT_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["found", "status", "frictionFlags", "criteriaSummary", "criteriaVerbatim", "administeringEntity", "effectiveDate", "confidence"],
+  required: [
+    "found", "status", "frictionFlags", "criteriaSummary", "criteriaVerbatim",
+    "administeringEntity", "effectiveDate", "documentDate", "otherVersions", "confidence",
+  ],
   properties: {
     found: { type: "boolean", description: "false if the excerpt says nothing about this state and this treatment" },
     status: { type: "string", enum: STATUSES as unknown as string[] },
@@ -53,12 +71,27 @@ const EXTRACT_SCHEMA = {
     criteriaSummary: { type: ["string", "null"] },
     criteriaVerbatim: { type: ["string", "null"], description: "Exact characters from the excerpt, or null." },
     administeringEntity: { type: ["string", "null"], description: "State agency or contracted PBM named in the excerpt" },
-    effectiveDate: { type: ["string", "null"] },
+    effectiveDate: { type: ["string", "null"], description: "ISO date the CURRENT policy took effect" },
+    documentDate: { type: ["string", "null"], description: "ISO date this document was published or last revised" },
+    otherVersions: {
+      type: "array",
+      description:
+        "Dated versions of this state's policy OTHER than the current one that the excerpt describes — what the rule " +
+        "was before a change, or what it becomes on a future date. Empty array when the excerpt describes only one.",
+      items: VERSION_SCHEMA,
+    },
     confidence: { type: "string", enum: ["high", "moderate", "review_needed"] },
   },
 } as const
 
-type Extraction = {
+export type ExtractedVersion = {
+  status: CoverageStatus
+  frictionFlags: FrictionFlag[]
+  effectiveDate: string | null
+  note: string | null
+}
+
+export type Extraction = {
   found: boolean
   status: CoverageStatus
   frictionFlags: FrictionFlag[]
@@ -66,6 +99,8 @@ type Extraction = {
   criteriaVerbatim: string | null
   administeringEntity: string | null
   effectiveDate: string | null
+  documentDate?: string | null
+  otherVersions?: ExtractedVersion[]
   confidence: Confidence
 }
 
@@ -74,8 +109,10 @@ export type SubagentInput = {
   spec: ConditionSpec
   baseline: BaselineRow | undefined
   prior: CoverageRecord | undefined
-  /** Held by the orchestrator; decremented when a subagent takes the metered rung. */
-  agentBudget: { remaining: number }
+  /** The scan-wide ceiling. Every call this subagent makes is reserved through it. */
+  budget: Budget
+  /** Shared across the scan: leads found here feed the backfill pass. */
+  leads?: LeadPool
   onProgress?: (note: string) => void
 }
 
@@ -110,11 +147,46 @@ function rankPolicyUrls(results: { url: string; title: string }[], stateName: st
     .map((r) => r.url)
 }
 
-function toRecord(
+/** Turn one extraction into a dated version of the state's policy. */
+function toVersion(
+  e: { status: CoverageStatus; frictionFlags: FrictionFlag[]; effectiveDate: string | null; criteriaSummary?: string | null; criteriaVerbatim?: string | null },
+  meta: { documentDate: string | null; sourceDoc: string | null; sourceUrl: string | null; isCurrent: boolean },
+): PolicyVersion {
+  const flags = [...new Set(e.frictionFlags ?? [])]
+  const status = e.status === "covered" && flags.includes("prior_authorization") ? "conditional" : e.status
+  return {
+    status,
+    authorization: flags.includes("step_therapy")
+      ? "step_therapy"
+      : flags.includes("prior_authorization")
+        ? "prior_authorization"
+        : "none",
+    frictionFlags: flags,
+    frictionIndex: frictionIndex(status, flags),
+    criteriaSummary: e.criteriaSummary ?? null,
+    criteriaVerbatim: e.criteriaVerbatim ?? null,
+    effectiveDate: e.effectiveDate,
+    documentDate: meta.documentDate,
+    sourceDoc: meta.sourceDoc,
+    sourceUrl: meta.sourceUrl,
+    isCurrent: meta.isCurrent,
+    discoveredAt: new Date().toISOString(),
+  }
+}
+
+export function toRecord(
   state: string,
   spec: ConditionSpec,
   e: Extraction,
-  meta: { method: CoverageRecord["method"]; sourceDoc: string | null; sourceUrl: string | null; evidenceHash: string | null; notes?: string | null },
+  meta: {
+    method: CoverageRecord["method"]
+    sourceDoc: string | null
+    sourceUrl: string | null
+    evidenceHash: string | null
+    notes?: string | null
+    /** Versions already known for this state, e.g. from an earlier pass. */
+    priorHistory?: PolicyVersion[]
+  },
 ): CoverageRecord {
   const flags = [...new Set(e.frictionFlags ?? [])]
   // A prior-authorization flag and a "covered with no gate" status contradict each
@@ -127,6 +199,22 @@ function toRecord(
       ? "prior_authorization"
       : "none"
   const friction = frictionIndex(status, flags)
+  const documentDate = e.documentDate ?? null
+
+  const current = toVersion(
+    { status, frictionFlags: flags, effectiveDate: e.effectiveDate, criteriaSummary: e.criteriaSummary, criteriaVerbatim: e.criteriaVerbatim },
+    { documentDate, sourceDoc: meta.sourceDoc, sourceUrl: meta.sourceUrl, isCurrent: true },
+  )
+  // Dated versions the source described other than the one in force. These are
+  // what let a first scan show a timeline instead of a single flat snapshot.
+  const others = (e.otherVersions ?? [])
+    .filter((v) => v.status && (v.effectiveDate || v.note))
+    .map((v) =>
+      toVersion(
+        { status: v.status, frictionFlags: v.frictionFlags ?? [], effectiveDate: v.effectiveDate, criteriaSummary: v.note },
+        { documentDate, sourceDoc: meta.sourceDoc, sourceUrl: meta.sourceUrl, isCurrent: false },
+      ),
+    )
 
   return {
     state,
@@ -147,13 +235,15 @@ function toRecord(
     confidence: e.confidence,
     method: meta.method,
     lastCheckedAt: new Date().toISOString(),
+    documentDate,
+    history: sortHistory([...(meta.priorHistory ?? []), ...others, current]),
     evidenceHash: meta.evidenceHash,
     notes: meta.notes ?? null,
   }
 }
 
 export async function runSubagent(input: SubagentInput): Promise<SubagentOutcome> {
-  const { state, spec, baseline, prior, agentBudget } = input
+  const { state, spec, baseline, prior, budget, leads } = input
   const stateName = STATE_NAMES[state]
   const terms = [...spec.searchTerms, ...spec.treatments.map((t) => t.toLowerCase())]
   let searches = 0
@@ -163,14 +253,18 @@ export async function runSubagent(input: SubagentInput): Promise<SubagentOutcome
 
   // Rung 1 — find the state's own policy document.
   let hits: { url: string; title: string }[] = []
-  try {
-    const found = await search(
-      `${stateName} Medicaid ${spec.treatmentClass} prior authorization criteria preferred drug list ${spec.name}`,
-    )
+  if (budget.spendCalls(1)) {
     searches = 1
-    hits = found.map((r) => ({ url: r.url, title: r.title }))
-  } catch {
-    /* the ladder degrades: no search just means we lean on the baseline */
+    try {
+      const found = await search(
+        `${stateName} Medicaid ${spec.treatmentClass} prior authorization criteria preferred drug list ${spec.name}`,
+      )
+      hits = found.map((r) => ({ url: r.url, title: r.title }))
+      // Everything we do not fetch now is a lead for the backfill pass.
+      for (const hit of hits) leads?.add(hit.url, hit.title, state, "search", stateName)
+    } catch {
+      /* the ladder degrades: no search just means we lean on the baseline */
+    }
   }
   // Three candidates in one batched fetch: state portals are full of thin landing
   // pages that never name the drug, and a second and third try costs nothing.
@@ -180,12 +274,17 @@ export async function runSubagent(input: SubagentInput): Promise<SubagentOutcome
   let excerpt = ""
   let sourceUrl: string | null = null
   let sourceDoc: string | null = null
-  if (urls.length > 0) {
+  let documentDate: string | null = null
+  if (urls.length > 0 && budget.spendCalls(1)) {
+    fetches = 1
+    leads?.markSpent(urls)
     try {
       const docs = await fetchContents(urls, 60_000)
-      fetches = 1
       for (const doc of docs) {
         const text = doc.text ?? ""
+        // Outbound links are harvested even from the wrong page — the landing
+        // page that answered nothing usually links to the document that does.
+        leads?.addPageLinks(doc.links, state, stateName)
         if (text.length < 400) continue
         naiveTokens += estimateTokens(text)
         const windowed = windowText(text, terms, { radius: 900, maxWindows: 6 })
@@ -194,6 +293,7 @@ export async function runSubagent(input: SubagentInput): Promise<SubagentOutcome
         excerpt = windowed
         sourceUrl = doc.final_url ?? doc.url
         sourceDoc = doc.title ?? null
+        documentDate = guessDocumentDate(doc)
         break
       }
     } catch {
@@ -204,7 +304,7 @@ export async function runSubagent(input: SubagentInput): Promise<SubagentOutcome
   // Rung 0 — nothing has moved since last time. Free.
   const candidateHash = excerpt ? sha256(excerpt) : null
   if (candidateHash && prior?.evidenceHash === candidateHash) {
-    input.onProgress?.(`${state}: source unchanged, carried forward`)
+    input.onProgress?.(`${state}: source unchanged since last scan, carried forward`)
     return {
       record: { ...prior, lastCheckedAt: new Date().toISOString(), method: "carried_forward" },
       searches,
@@ -216,14 +316,13 @@ export async function runSubagent(input: SubagentInput): Promise<SubagentOutcome
   }
 
   // Rung 3 — the state portal blocked us. Spend a metered browser run, if the
-  // orchestrator's budget allows and the baseline has not already answered.
-  if (!excerpt && agentBudget.remaining > 0 && (!baseline || baseline.confidence !== "high")) {
+  // scan's budget allows and the baseline has not already answered.
+  if (!excerpt && (!baseline || baseline.confidence !== "high")) {
     const target = urls[0] ?? hits[0]?.url
-    if (target) {
-      agentBudget.remaining--
+    if (target && budget.spendAgentRun()) {
       agentRuns = 1
       try {
-        input.onProgress?.(`${state}: fetch blocked, escalating to browser agent`)
+        input.onProgress?.(`${state}: plain fetch blocked, escalating to a stealth browser`)
         const raw = await runAgent({
           url: target,
           stealth: true,
@@ -234,8 +333,12 @@ export async function runSubagent(input: SubagentInput): Promise<SubagentOutcome
             `{"found":boolean,"status":"covered|conditional|limited|not_covered|unpublished",` +
             `"frictionFlags":[${FLAGS.map((f) => `"${f}"`).join("|")}],"criteriaSummary":"one plain sentence",` +
             `"criteriaVerbatim":"exact wording from the page or null","administeringEntity":"state agency or PBM or null",` +
-            `"effectiveDate":"YYYY-MM-DD or null","confidence":"high|moderate|review_needed"}\n` +
-            `Set found=false if the page does not address this treatment. Never guess a status.`,
+            `"effectiveDate":"YYYY-MM-DD or null","documentDate":"YYYY-MM-DD the page was published or revised, or null",` +
+            `"otherVersions":[{"status":"...","frictionFlags":[],"effectiveDate":"YYYY-MM-DD","note":"what the page says this earlier or later version was"}],` +
+            `"confidence":"high|moderate|review_needed"}\n` +
+            `otherVersions captures any DATED earlier or later version of this policy the page describes — what the ` +
+            `rule was before a change, or what it becomes on a future date. Use an empty array if the page describes ` +
+            `only one version. Set found=false if the page does not address this treatment. Never guess a status.`,
           onProgress: (p) => input.onProgress?.(`${state}: ${p}`),
         })
         const parsed = unwrapAgentResult(raw) as Extraction | null
@@ -247,12 +350,13 @@ export async function runSubagent(input: SubagentInput): Promise<SubagentOutcome
               sourceUrl: target,
               evidenceHash: sha256(JSON.stringify(parsed)),
               notes: "Read by a stealth browser agent — the state portal refuses plain fetchers.",
+              priorHistory: prior?.history,
             }),
             searches, fetches, agentRuns, shortCircuited: false, naiveTokens,
           }
         }
       } catch (err) {
-        input.onProgress?.(`${state}: agent run failed (${String(err).slice(0, 80)})`)
+        input.onProgress?.(`${state}: browser run failed (${String(err).slice(0, 80)})`)
       }
     }
   }
@@ -267,7 +371,7 @@ export async function runSubagent(input: SubagentInput): Promise<SubagentOutcome
         schema: EXTRACT_SCHEMA,
         schemaName: "state_extraction",
         label: `extract ${state}`,
-        maxTokens: 1400,
+        maxTokens: 2000,
         system:
           `You are reading an excerpt of ${stateName}'s own Medicaid policy documents. Report only what this excerpt ` +
           `states about coverage of ${spec.treatmentClass} (${spec.treatments.join(", ")}) for ${spec.name}.\n\n` +
@@ -276,6 +380,11 @@ export async function runSubagent(input: SubagentInput): Promise<SubagentOutcome
           `unpublished = the excerpt does not establish a policy.\n\n` +
           `frictionFlags: only gates the excerpt actually states. Do not infer. An empty array is a real answer.\n` +
           `criteriaVerbatim: exact characters from the excerpt, under 400 characters, or null.\n` +
+          `effectiveDate: when the CURRENT policy took effect. documentDate: when this document was published or revised.\n` +
+          `otherVersions: any DATED earlier or later version of this state's policy the excerpt describes — a bulletin ` +
+          `announcing a change usually states what the rule was before it, and a superseded list carries the date it ` +
+          `stopped applying. This is how coverage change gets recorded, so capture it whenever the excerpt supports it. ` +
+          `Return an empty array when the excerpt describes only the current version.\n` +
           (baseline
             ? `A national tracker reports "${baseline.status}" for ${stateName}. Treat that as context, not evidence: ` +
               `this excerpt is the state's own document and outranks it. Contradict the tracker only if the excerpt is clear.\n`
@@ -285,11 +394,12 @@ export async function runSubagent(input: SubagentInput): Promise<SubagentOutcome
       })
       if (parsed.found) {
         return {
-          record: toRecord(state, spec, parsed, {
+          record: toRecord(state, spec, { ...parsed, documentDate: parsed.documentDate ?? documentDate }, {
             method: "fetch",
-            sourceDoc: sourceDoc,
+            sourceDoc,
             sourceUrl,
             evidenceHash: candidateHash,
+            priorHistory: prior?.history,
           }),
           searches, fetches, agentRuns, shortCircuited: false, naiveTokens,
         }
@@ -314,6 +424,8 @@ export async function runSubagent(input: SubagentInput): Promise<SubagentOutcome
           criteriaVerbatim: baseline.criteriaVerbatim,
           administeringEntity: null,
           effectiveDate: baseline.effectiveDate,
+          documentDate: baseline.effectiveDate,
+          otherVersions: [],
           confidence: baseline.confidence === "high" ? "moderate" : "review_needed",
         },
         {
@@ -322,14 +434,16 @@ export async function runSubagent(input: SubagentInput): Promise<SubagentOutcome
           sourceUrl: baseline.sourceUrl,
           evidenceHash: null,
           notes: "From a multi-state tracker; the state's own publication did not corroborate it in this scan.",
+          priorHistory: prior?.history,
         },
       ),
       searches, fetches, agentRuns, shortCircuited: false, naiveTokens,
     }
   }
 
-  // Nothing anywhere. "No published fee-for-service policy" is a real and
-  // reportable finding — several states genuinely leave this to their MCOs.
+  // Nothing anywhere yet. "No published fee-for-service policy" is a real and
+  // reportable finding — several states genuinely leave this to their MCOs — but
+  // it is also the gap the backfill pass exists to attack before we settle on it.
   return {
     record: toRecord(
       state,
@@ -338,13 +452,15 @@ export async function runSubagent(input: SubagentInput): Promise<SubagentOutcome
         found: true,
         status: "unpublished",
         frictionFlags: [],
-        criteriaSummary: `No published fee-for-service policy for ${spec.treatmentClass} was found for ${stateName} in this scan.`,
+        criteriaSummary: null,
         criteriaVerbatim: null,
         administeringEntity: null,
         effectiveDate: null,
+        documentDate: null,
+        otherVersions: [],
         confidence: "review_needed",
       },
-      { method: "search", sourceDoc: null, sourceUrl: urls[0] ?? null, evidenceHash: null },
+      { method: "search", sourceDoc: null, sourceUrl: urls[0] ?? null, evidenceHash: null, priorHistory: prior?.history },
     ),
     searches, fetches, agentRuns, shortCircuited: false, naiveTokens,
   }

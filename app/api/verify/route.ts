@@ -1,6 +1,8 @@
 import { getCondition, mergeChanges, patchLatestRecord, readSnapshot } from "@/agent/lib/store"
 import { runSubagent } from "@/agent/phases/subagent"
 import { STATE_NAMES } from "@/agent/lib/types"
+import { Budget } from "@/agent/lib/budget"
+import { LeadPool } from "@/agent/lib/leads"
 
 export const runtime = "nodejs"
 export const maxDuration = 300
@@ -40,12 +42,16 @@ export async function POST(request: Request) {
 
   const startedAt = Date.now()
   try {
+    // A single-state re-check gets a small budget of its own: enough calls to
+    // walk the ladder once, including one stealth browser run if the state's
+    // portal refuses a plain fetch.
     const outcome = await runSubagent({
       state,
       spec,
       baseline: undefined,
       prior,
-      agentBudget: { remaining: 1 },
+      budget: new Budget({ maxTinyfishCalls: 6, maxSteps: 4, maxAgentRuns: 1 }),
+      leads: new LeadPool(),
     })
     const record = outcome.record
     await patchLatestRecord(slug, record)

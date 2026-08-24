@@ -24,7 +24,17 @@
 // isn't measured is just a claim.
 
 import { ledger, modelFor } from "./lib/llm"
-import { diffSnapshots, findOutliers, frictionIndex } from "./lib/derive"
+import {
+  changesFromHistory,
+  diffSnapshots,
+  findOutliers,
+  frictionIndex,
+  gapsFor,
+  isRecordComplete,
+  sortHistory,
+} from "./lib/derive"
+import { Budget, DEFAULT_LIMITS, type BudgetLimits } from "./lib/budget"
+import { LeadPool } from "./lib/leads"
 import {
   appendRun,
   getCondition,
@@ -47,6 +57,7 @@ import { resolveCondition } from "./phases/resolve"
 import { discoverSources } from "./phases/discover"
 import { buildBaseline, type BaselineRow } from "./phases/baseline"
 import { runSubagent } from "./phases/subagent"
+import { backfill, inferRemaining } from "./phases/backfill"
 import { discoverReportedChanges } from "./phases/changes"
 
 export type ScanEvent =
@@ -54,7 +65,9 @@ export type ScanEvent =
   | { type: "condition"; spec: ConditionSpec }
   | { type: "plan"; total: number; fromBaseline: number; toFanOut: number }
   | { type: "state"; record: CoverageRecord; done: number; total: number }
-  | { type: "changes"; observed: number; reported: number }
+  | { type: "changes"; observed: number; historical: number; reported: number }
+  /** Budget pressure, so the console can show how much room is left. */
+  | { type: "budget"; tinyfishCalls: number; maxTinyfishCalls: number; steps: number; maxSteps: number }
   | { type: "complete"; snapshotStamp: string; ledger: RunLedger; outliers: ReturnType<typeof findOutliers> }
   | { type: "error"; message: string }
 
@@ -72,6 +85,8 @@ export type ScanOptions = {
   /** Concurrency. Waves of 5 matches TinyFish's plan-based limits. */
   waveSize?: number
   changeWindowDays?: number
+  /** Hard ceilings. Defaults: 200 TinyFish calls, 80 orchestrator steps. */
+  limits?: Partial<BudgetLimits>
   onEvent?: (event: ScanEvent) => void
 }
 
@@ -80,8 +95,14 @@ const ALL_STATES = STATES.map(([, , code]) => code)
 export async function scan(opts: ScanOptions): Promise<{ snapshot: Snapshot; ledger: RunLedger }> {
   const depth = opts.depth ?? "standard"
   const waveSize = opts.waveSize ?? 5
-  const agentBudget = { remaining: opts.agentBudget ?? 6 }
+  const budget = new Budget({
+    ...DEFAULT_LIMITS,
+    ...opts.limits,
+    maxAgentRuns: opts.agentBudget ?? opts.limits?.maxAgentRuns ?? DEFAULT_LIMITS.maxAgentRuns,
+  })
+  const leads = new LeadPool()
   const emit = (e: ScanEvent) => opts.onEvent?.(e)
+  const emitBudget = () => emit({ type: "budget", ...budget.snapshot() })
   const startedAt = new Date().toISOString()
   const t0 = Date.now()
   ledger.reset()
@@ -102,38 +123,45 @@ export async function scan(opts: ScanOptions): Promise<{ snapshot: Snapshot; led
     statesShortCircuited: 0,
     statesEscalated: 0,
     naivePromptTokensEstimate: 0,
+    statesBackfilled: 0,
+    statesInferred: 0,
+    historicalChanges: 0,
+    budget: budget.snapshot(),
     errors: [],
   }
 
   try {
     // Phase 0 — resolve. A saved condition skips the model call entirely.
+    budget.spendStep()
     emit({ type: "phase", phase: "resolve", note: `Interpreting "${opts.condition}"` })
     const saved = (await getCondition(opts.condition)) ?? (await matchSaved(opts.condition))
     const spec = saved ?? (await resolveCondition(opts.condition))
     run.conditionSlug = spec.slug
     await saveCondition(spec)
     emit({ type: "condition", spec })
-    emit({
-      type: "phase",
-      phase: "resolve",
-      note: `${spec.name} · ${spec.treatmentClass} — ${spec.policyLever}`,
-    })
+    emit({ type: "phase", phase: "resolve", note: `${spec.name} · ${spec.treatmentClass} — ${spec.policyLever}` })
 
     const previous = await readSnapshot(spec.slug)
     const prior = new Map((previous?.records ?? []).map((r) => [r.state, r]))
 
     // Phase 1 — discover sources.
+    budget.spendStep()
     emit({ type: "phase", phase: "discover", note: "Searching for multi-state policy trackers" })
-    const discovery = await discoverSources(spec, (n) => emit({ type: "phase", phase: "discover", note: n }))
+    const discovery = await discoverSources(spec, budget, leads, (n) =>
+      emit({ type: "phase", phase: "discover", note: n }),
+    )
     run.tinyfishSearches += discovery.searches
+    emitBudget()
 
     // Phase 2 — one read, fifty answers.
+    budget.spendStep()
     emit({ type: "phase", phase: "baseline", note: "Reading trackers" })
-    const baseline = await buildBaseline(spec, discovery.sources, previous?.records ?? [], (n) =>
+    const baseline = await buildBaseline(spec, discovery.sources, previous?.records ?? [], budget, (n) =>
       emit({ type: "phase", phase: "baseline", note: n }),
     )
     run.tinyfishFetches += baseline.fetches
     run.naivePromptTokensEstimate += baseline.naiveTokens
+    emitBudget()
 
     // Plan: which states still need their own subagent.
     const needsWork = ALL_STATES.filter((code) => {
@@ -153,22 +181,31 @@ export async function scan(opts: ScanOptions): Promise<{ snapshot: Snapshot; led
 
     const records = new Map<string, CoverageRecord>()
     let done = 0
+    const land = (record: CoverageRecord) => {
+      records.set(record.state, record)
+      done = records.size
+      emit({ type: "state", record, done, total: ALL_STATES.length })
+    }
 
     // States the baseline settled: promote the row straight to a record.
     for (const code of settled) {
       const row = baseline.rows.get(code)
-      const record = row
-        ? rowToRecord(code, row)
-        : unpublishedRecord(code, spec.treatmentClass)
-      records.set(code, record)
-      done++
-      emit({ type: "state", record, done, total: ALL_STATES.length })
+      land(row ? rowToRecord(code, row) : unpublishedRecord(code, spec.treatmentClass))
     }
 
     // Phase 3 — fan out. Waves of `waveSize`, isolated per state, failures contained.
     emit({ type: "phase", phase: "fanout", note: `Fanning out ${needsWork.length} states in waves of ${waveSize}` })
     for (let i = 0; i < needsWork.length; i += waveSize) {
+      if (budget.exhausted) {
+        emit({
+          type: "phase",
+          phase: "fanout",
+          note: `Budget ceiling reached (${budget.stopReason.replace("_", " ")}) — ${needsWork.length - i} states left to the backfill and inference passes`,
+        })
+        break
+      }
       const wave = needsWork.slice(i, i + waveSize)
+      budget.spendStep(wave.length)
       const results = await Promise.allSettled(
         wave.map((code) =>
           runSubagent({
@@ -176,7 +213,8 @@ export async function scan(opts: ScanOptions): Promise<{ snapshot: Snapshot; led
             spec,
             baseline: baseline.rows.get(code),
             prior: prior.get(code),
-            agentBudget,
+            budget,
+            leads,
             onProgress: (note) => emit({ type: "phase", phase: "fanout", note }),
           }),
         ),
@@ -200,33 +238,96 @@ export async function scan(opts: ScanOptions): Promise<{ snapshot: Snapshot; led
           const row = baseline.rows.get(code)
           record = row ? rowToRecord(code, row) : (prior.get(code) ?? unpublishedRecord(code, spec.treatmentClass))
         }
-        records.set(code, record)
-        done++
-        emit({ type: "state", record, done, total: ALL_STATES.length })
+        land(record)
+      }
+      emitBudget()
+    }
+
+    // Any state the fan-out never reached still needs a row on the map.
+    for (const code of ALL_STATES) {
+      if (!records.has(code)) {
+        const row = baseline.rows.get(code)
+        land(row ? rowToRecord(code, row) : (prior.get(code) ?? unpublishedRecord(code, spec.treatmentClass)))
       }
     }
 
-    const allRecords = ALL_STATES.map((c) => records.get(c)!).filter(Boolean)
+    // Phase 3b — go back for the gaps, following banked leads, until the list is
+    // empty or the budget closes. This is the difference between a map with grey
+    // holes and one where every jurisdiction carries a timestamped, cited answer.
+    const incomplete = [...records.values()].filter((r) => !isRecordComplete(r))
+    if (incomplete.length > 0 && !budget.exhausted && depth !== "baseline") {
+      budget.spendStep()
+      emit({
+        type: "phase",
+        phase: "backfill",
+        note: `${incomplete.length} jurisdictions incomplete · ${leads.size} leads banked from pages already read`,
+      })
+      const filled = await backfill({
+        spec,
+        records,
+        budget,
+        leads,
+        maxRounds: 5,
+        onProgress: (note) => emit({ type: "phase", phase: "backfill", note }),
+        onRecord: (record) => land(record),
+      })
+      run.statesBackfilled = filled.filled
+      run.tinyfishSearches += filled.searches
+      run.tinyfishFetches += filled.fetches
+      run.naivePromptTokensEstimate += filled.naiveTokens
+      emit({
+        type: "phase",
+        phase: "backfill",
+        note: `${filled.filled} gaps closed · ${filled.remainingGaps.length} jurisdictions still incomplete`,
+      })
+      emitBudget()
+    }
 
-    // Phase 4 — the delta. Observed beats reported where both exist.
+    // Termination. Either every jurisdiction is answered — the good ending, and
+    // we stop before spending the rest of the budget — or a ceiling bound, and
+    // whatever is still missing gets filled from model knowledge and flagged.
+    const stillMissing = [...records.values()].filter((r) => gapsFor(r).includes("no_policy_found"))
+    if (stillMissing.length === 0) {
+      budget.markComplete()
+      emit({
+        type: "phase",
+        phase: "plan",
+        note: `Every jurisdiction answered with a source and a timestamp — stopping at ${budget.tinyfishCalls}/${budget.limits.maxTinyfishCalls} calls`,
+      })
+    } else {
+      run.statesInferred = await inferRemaining(spec, records, (note) =>
+        emit({ type: "phase", phase: "infer", note }),
+      )
+      for (const record of records.values()) if (record.method === "inferred") land(record)
+    }
+
+    const allRecords = ALL_STATES.map((c) => records.get(c)!).filter(Boolean)
+    for (const record of allRecords) record.history = sortHistory(record.history ?? [])
+
+    // Phase 4 — the delta, from three independent directions.
     emit({ type: "phase", phase: "changes", note: "Computing deltas and searching for dated announcements" })
     const observed = previous ? diffSnapshots(previous.records, allRecords, new Date().toISOString()) : []
+    const historical = changesFromHistory(allRecords, new Date().toISOString())
+    run.historicalChanges = historical.length
     let reported: Awaited<ReturnType<typeof discoverReportedChanges>> = { events: [], searches: 0 }
     try {
-      reported = await discoverReportedChanges(spec, opts.changeWindowDays ?? 180, (n) =>
+      reported = await discoverReportedChanges(spec, opts.changeWindowDays ?? 365, budget, (n) =>
         emit({ type: "phase", phase: "changes", note: n }),
       )
       run.tinyfishSearches += reported.searches
     } catch (err) {
       run.errors.push(`reported changes: ${String(err).slice(0, 160)}`)
     }
-    const changes = await mergeChanges(spec.slug, [...reported.events, ...observed])
-    emit({ type: "changes", observed: observed.length, reported: reported.events.length })
+    // Merge order matters: later entries win on an id collision, and an event we
+    // observed ourselves outranks one we merely read about.
+    const changes = await mergeChanges(spec.slug, [...reported.events, ...historical, ...observed])
+    emit({ type: "changes", observed: observed.length, historical: historical.length, reported: reported.events.length })
 
     // Phase 5 — write the snapshot and close the ledger.
     run.llmCalls = ledger.calls
     run.promptTokens = ledger.promptTokens
     run.completionTokens = ledger.completionTokens
+    run.budget = budget.snapshot()
     run.durationMs = Date.now() - t0
     run.finishedAt = new Date().toISOString()
 
@@ -240,16 +341,12 @@ export async function scan(opts: ScanOptions): Promise<{ snapshot: Snapshot; led
     const stamp = await writeSnapshot(snapshot)
     await appendRun(run)
 
-    emit({
-      type: "complete",
-      snapshotStamp: stamp,
-      ledger: run,
-      outliers: findOutliers(allRecords, changes),
-    })
+    emit({ type: "complete", snapshotStamp: stamp, ledger: run, outliers: findOutliers(allRecords, changes) })
     return { snapshot, ledger: run }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     run.errors.push(message)
+    run.budget = budget.snapshot()
     run.durationMs = Date.now() - t0
     run.finishedAt = new Date().toISOString()
     await appendRun(run)
@@ -295,6 +392,27 @@ function rowToRecord(code: string, row: BaselineRow): CoverageRecord {
     confidence: row.confidence,
     method: "baseline",
     lastCheckedAt: new Date().toISOString(),
+    documentDate: row.effectiveDate,
+    history: [
+      {
+        status,
+        authorization: flags.includes("step_therapy")
+          ? "step_therapy"
+          : flags.includes("prior_authorization")
+            ? "prior_authorization"
+            : "none",
+        frictionFlags: flags,
+        frictionIndex: friction,
+        criteriaSummary: row.criteriaSummary,
+        criteriaVerbatim: row.criteriaVerbatim,
+        effectiveDate: row.effectiveDate,
+        documentDate: row.effectiveDate,
+        sourceDoc: row.sourceDoc,
+        sourceUrl: row.sourceUrl,
+        isCurrent: true,
+        discoveredAt: new Date().toISOString(),
+      },
+    ],
     evidenceHash: null,
     notes: null,
   }
@@ -320,6 +438,8 @@ function unpublishedRecord(code: string, treatmentClass: string): CoverageRecord
     confidence: "review_needed",
     method: "search",
     lastCheckedAt: new Date().toISOString(),
+    documentDate: null,
+    history: [],
     evidenceHash: null,
     notes: null,
   }
@@ -328,12 +448,21 @@ function unpublishedRecord(code: string, treatmentClass: string): CoverageRecord
 export function ledgerSummary(run: RunLedger): string {
   const saved = run.naivePromptTokensEstimate - run.promptTokens
   const ratio = run.promptTokens > 0 ? run.naivePromptTokensEstimate / run.promptTokens : 0
+  const stopped =
+    run.budget.stoppedBecause === "complete"
+      ? "every jurisdiction answered"
+      : run.budget.stoppedBecause === "call_cap"
+        ? "TinyFish call ceiling reached"
+        : "orchestrator step ceiling reached"
   return [
-    `run ${run.runId} · ${(run.durationMs / 1000).toFixed(1)}s`,
+    `run ${run.runId} · ${(run.durationMs / 1000).toFixed(1)}s · stopped because ${stopped}`,
+    `budget: ${run.budget.tinyfishCalls}/${run.budget.maxTinyfishCalls} tinyfish calls, ${run.budget.steps}/${run.budget.maxSteps} steps`,
     `tinyfish: ${run.tinyfishSearches} searches, ${run.tinyfishFetches} fetches, ${run.tinyfishAgentRuns} agent runs`,
     `llm: ${run.llmCalls} calls, ${run.promptTokens.toLocaleString()} prompt + ${run.completionTokens.toLocaleString()} completion tokens`,
     `  smart=${modelFor("smart")}  cheap=${modelFor("cheap")}`,
     `plan: ${run.statesFromBaseline} from baseline, ${run.statesShortCircuited} short-circuited, ${run.statesEscalated} escalated to browser`,
+    `gaps: ${run.statesBackfilled} closed by backfill, ${run.statesInferred} inferred after the budget closed`,
+    `history: ${run.historicalChanges} change events derived from dated versions found in this scan`,
     `saved ~${saved.toLocaleString()} prompt tokens vs a whole-document-per-state loop (${ratio.toFixed(1)}x)`,
     run.errors.length ? `errors: ${run.errors.length}` : "no errors",
   ].join("\n")

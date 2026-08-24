@@ -9,6 +9,8 @@
 // multi-state coverage above authority.
 
 import { search, type SearchResult } from "../lib/tinyfish"
+import type { Budget } from "../lib/budget"
+import type { LeadPool } from "../lib/leads"
 import { askJson } from "../lib/llm"
 import type { ConditionSpec, DiscoveredSource } from "../lib/types"
 
@@ -47,16 +49,22 @@ function queries(spec: ConditionSpec): string[] {
 
 export async function discoverSources(
   spec: ConditionSpec,
+  budget: Budget,
+  leads: LeadPool,
   onProgress?: (note: string) => void,
 ): Promise<{ sources: DiscoveredSource[]; searches: number }> {
   const seen = new Map<string, SearchResult>()
-  const qs = queries(spec)
+  // Only issue as many queries as the ceiling can afford.
+  const qs = queries(spec).slice(0, Math.max(1, Math.min(4, budget.callsLeft)))
+  if (!budget.spendCalls(qs.length)) return { sources: [], searches: 0 }
 
   const batches = await Promise.allSettled(qs.map((q) => search(q)))
   for (const batch of batches) {
     if (batch.status !== "fulfilled") continue
     for (const hit of batch.value.slice(0, 8)) {
       if (!seen.has(hit.url)) seen.set(hit.url, hit)
+      // Everything discovery surfaces but does not read becomes a national lead.
+      leads.add(hit.url, hit.title, null, "search", null)
     }
   }
   onProgress?.(`${seen.size} candidate sources from ${qs.length} searches`)

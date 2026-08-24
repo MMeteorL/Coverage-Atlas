@@ -111,10 +111,10 @@ rewording. Each event is joined to the state's current status.
       "fromStatus": "conditional", "toStatus": "not_covered", "frictionDelta": 47,
       "announcedOn": "2026-07-01", "effectiveOn": "2026-07-01",
       "sourceDoc": "…", "sourceUrl": "…",
-      "provenance": "observed", "detectedAt": "2026-08-23T18:45:12.345Z",
+      "provenance": "historical", "detectedAt": "2026-08-23T18:45:12.345Z",
       "currentStatus": "not_covered" }
   ],
-  "summary": { "total": 14, "widened": 5, "tightened": 9, "observed": 6, "reported": 8 }
+  "summary": { "total": 14, "widened": 5, "tightened": 9, "observed": 6, "historical": 5, "reported": 3 }
 }
 ```
 
@@ -127,7 +127,11 @@ Runs a full scan and streams it. `maxDuration` 800s.
 {
   "condition": "GLP-1 drugs for weight loss",  // free text, or a saved slug
   "depth": "standard",                          // "baseline" | "standard" | "deep"
-  "agentBudget": 6                              // optional; metered browser-run ceiling
+  "agentBudget": 6,                             // optional; metered browser-run ceiling
+  "limits": {                                   // optional; hard ceilings
+    "maxTinyfishCalls": 200,
+    "maxSteps": 80
+  }
 }
 ```
 
@@ -147,14 +151,24 @@ Each SSE `data:` line is one JSON object with a `type`.
 | `phase` | `{phase, note}` | Throughout — human-readable progress |
 | `condition` | `{spec}` | Once resolution completes |
 | `plan` | `{total, fromBaseline, toFanOut}` | **Before** the fan-out |
-| `state` | `{record, done, total}` | Once per jurisdiction, as it lands |
-| `changes` | `{observed, reported}` | After delta computation |
+| `state` | `{record, done, total}` | Once per jurisdiction, as it lands — and again when backfill or inference revises it |
+| `budget` | `{tinyfishCalls, maxTinyfishCalls, steps, maxSteps}` | After each phase and each wave |
+| `changes` | `{observed, historical, reported}` | After delta computation |
 | `complete` | `{snapshotStamp, ledger, outliers}` | Terminal, on success |
 | `error` | `{message}` | Terminal, on failure |
 
 The `plan` event firing before the fan-out is deliberate: the ratio it carries —
 how many jurisdictions one shared read settled versus how many needed their own
 subagent — is the efficiency argument, visible while it happens.
+
+`state` can fire more than once for the same jurisdiction. The backfill pass
+revises records in place as it closes gaps, and each revision re-emits, so the
+map corrects itself live. Consumers should key on `record.state`, not append.
+
+`phase` notes are the human-readable narration the UI shows as its one-line
+"what is it doing right now" indicator; the `phase` field itself maps to a verb
+(`fanout` → "Reading state policy documents", `backfill` → "Chasing down missing
+information").
 
 ### Consuming it
 

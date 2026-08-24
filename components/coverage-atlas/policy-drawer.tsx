@@ -1,7 +1,7 @@
 "use client"
 
 import { useState } from "react"
-import { ExternalLink, GitCompareArrows, Loader2, Pin, RefreshCw, X } from "lucide-react"
+import { AlertTriangle, ExternalLink, GitCompareArrows, Loader2, Pin, RefreshCw, X } from "lucide-react"
 import {
   AUTH_LABEL,
   CONFIDENCE_LABEL,
@@ -11,9 +11,11 @@ import {
   STATUS_LABEL,
   formatDate,
   frictionColor,
+  isInferred,
   relativeTime,
   type CoverageRecord,
 } from "@/lib/atlas"
+import { historyFor } from "@/agent/lib/derive"
 
 /**
  * One state, in full: the decision, the friction ledger that produced its score,
@@ -116,6 +118,17 @@ export function PolicyDrawer({
         </div>
 
         <div className="flex flex-col gap-6 p-5">
+          {isInferred(record) && (
+            <div className="flex items-start gap-2.5 rounded-md border border-[var(--policy-limited)]/40 bg-[var(--difference)] p-3">
+              <AlertTriangle className="mt-0.5 size-4 shrink-0" style={{ color: "var(--policy-limited)" }} />
+              <div className="text-xs leading-5">
+                <strong>Not verified against a source.</strong> The scan's call budget closed before this state was
+                resolved, so this record is the model's best understanding rather than something read from a document.
+                Re-check it below, or re-run the scan with a higher ceiling.
+              </div>
+            </div>
+          )}
+
           <Section title="Access friction">
             <div className="flex items-baseline gap-2">
               <span className="text-3xl font-semibold">{record.frictionIndex}</span>
@@ -148,6 +161,7 @@ export function PolicyDrawer({
             <Row label="Authorization" value={AUTH_LABEL[record.authorization]} />
             <Row label="Administering entity" value={record.administeringEntity ?? "Not named in source"} />
             <Row label="Effective date" value={formatDate(record.effectiveDate)} />
+            <Row label="Source document dated" value={formatDate(record.documentDate)} />
           </Section>
 
           {record.criteriaSummary && (
@@ -167,6 +181,8 @@ export function PolicyDrawer({
               </p>
             </Section>
           )}
+
+          <PolicyHistory record={record} />
 
           <Section title="Evidence">
             <div className="rounded-md border p-3">
@@ -240,5 +256,58 @@ function Row({ label, value }: { label: string; value: string }) {
       <span className="text-xs text-muted-foreground">{label}</span>
       <span className="text-right text-xs font-medium">{value}</span>
     </div>
+  )
+}
+
+
+/**
+ * The dated versions of this state's policy that the scan found.
+ *
+ * Rendered whenever there is more than one, because a single version is just the
+ * record above restated. Two or more is a timeline, and a timeline is the thing
+ * that makes a coverage record actionable — it says whether the rule you are
+ * reading has been stable for years or was rewritten last quarter.
+ */
+function PolicyHistory({ record }: { record: CoverageRecord }) {
+  const versions = historyFor(record)
+  if (versions.length < 2) return null
+
+  return (
+    <Section title={`Policy history · ${versions.length} dated versions`}>
+      <ol className="flex flex-col">
+        {versions.map((v, i) => (
+          <li key={`${v.effectiveDate ?? v.documentDate ?? i}-${i}`} className="relative pb-4 pl-5 last:pb-0">
+            <span
+              className="absolute left-0 top-1.5 size-2.5 rounded-full ring-2 ring-background"
+              style={{ background: STATUS_COLOR[v.status] }}
+            />
+            {i < versions.length - 1 && <span className="absolute left-[4.5px] top-4 h-full w-px bg-border" aria-hidden />}
+            <div className="flex flex-wrap items-baseline gap-x-2">
+              <span className="text-xs font-semibold">{STATUS_LABEL[v.status]}</span>
+              {v.isCurrent && (
+                <span className="rounded bg-accent px-1.5 py-0.5 text-[10px] font-medium text-primary">in force</span>
+              )}
+              <span className="text-[11px] text-muted-foreground">
+                {v.effectiveDate ? `effective ${formatDate(v.effectiveDate)}` : formatDate(v.documentDate)}
+              </span>
+            </div>
+            <div className="mt-0.5 text-[11px] text-muted-foreground">friction {v.frictionIndex}/100</div>
+            {v.criteriaVerbatim && (
+              <blockquote className="mt-1.5 border-l-2 border-border pl-2 text-[11px] italic leading-4 text-muted-foreground">
+                “{v.criteriaVerbatim.slice(0, 200)}
+                {v.criteriaVerbatim.length > 200 ? "…" : ""}”
+              </blockquote>
+            )}
+            {!v.criteriaVerbatim && v.criteriaSummary && (
+              <p className="mt-1 !text-[11px] leading-4">{v.criteriaSummary}</p>
+            )}
+          </li>
+        ))}
+      </ol>
+      <p className="mt-1">
+        Read from dated documents during the scan. Medicaid publishes no change feed, so a timeline like this has to be
+        assembled from the policies' own self-reference.
+      </p>
+    </Section>
   )
 }

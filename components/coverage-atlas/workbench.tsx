@@ -27,7 +27,7 @@ import {
 } from "@/lib/atlas"
 import { PolicyMap, type MapMode } from "./policy-map"
 import { PolicyDrawer } from "./policy-drawer"
-import { ScanConsole } from "./scan-console"
+import { ScanLogButton, ScanLogPanel, ScanProgressLine } from "./scan-progress"
 import { Changes, Compare, InsightRail, Matrix, StateDirectory, Timeline } from "./views"
 import { useAtlas, useConditions, useDisplayRecords, useScan } from "./use-atlas"
 
@@ -53,6 +53,7 @@ export function Workbench() {
   const [selected, setSelected] = useState<string | null>(null)
   const [pinned, setPinned] = useState<string[]>([])
   const [depth, setDepth] = useState<"baseline" | "standard" | "deep">("standard")
+  const [logOpen, setLogOpen] = useState(false)
 
   const { atlas, changes, loading, error, refresh } = useAtlas(slug, asOf, changeDays)
   const { scan, start, cancel, clear } = useScan(
@@ -69,6 +70,19 @@ export function Workbench() {
     const freshest = [...conditions].sort((a, b) => (b.lastScannedAt ?? "").localeCompare(a.lastScannedAt ?? ""))[0]
     setSlug(freshest.slug)
   }, [conditions, slug])
+
+  // A scan started from the landing page types free text; the scanner resolves it
+  // to a canonical condition. The moment it does, the header follows — otherwise
+  // the map fills in with states belonging to a condition the switcher above it
+  // is not showing, which is the most confusing thing this interface could do.
+  const resolvedSlug = scan.resolved?.slug ?? null
+  useEffect(() => {
+    if (!resolvedSlug || resolvedSlug === slug) return
+    setSlug(resolvedSlug)
+    setAsOf(null)
+    setSelected(null)
+    void refreshConditions()
+  }, [resolvedSlug, slug, refreshConditions])
 
   const condition = conditions.find((c) => c.slug === slug) ?? null
   const selectedRecord = records.find((r) => r.state === selected) ?? null
@@ -174,16 +188,23 @@ export function Workbench() {
               {scan.running ? <Loader2 className="size-3.5 animate-spin" /> : <Play className="size-3.5" />}
               {scan.running ? "Scanning…" : "Run scan"}
             </button>
-            <div className="hidden items-center gap-2 text-xs text-muted-foreground 2xl:flex">
-              <span className="size-2 rounded-full bg-[var(--policy-covered)]" />
-              {condition?.lastScannedAt ? `Scanned ${relativeTime(condition.lastScannedAt)}` : "Never scanned"}
-            </div>
+            <ScanLogButton scan={scan} onClick={() => setLogOpen(true)} />
+            {!scan.running && !scan.ledger && (
+              <div className="hidden items-center gap-2 text-xs text-muted-foreground 2xl:flex">
+                <span className="size-2 rounded-full bg-[var(--policy-covered)]" />
+                {condition?.lastScannedAt ? `Scanned ${relativeTime(condition.lastScannedAt)}` : "Never scanned"}
+              </div>
+            )}
           </div>
         </header>
 
         <main className="p-4 md:p-6">
           {!condition ? (
-            <EmptyState onScan={runScan} running={scan.running} />
+            <EmptyState
+              onScan={runScan}
+              running={scan.running}
+              progress={<ScanProgressLine scan={scan} onOpenLog={() => setLogOpen(true)} onCancel={cancel} />}
+            />
           ) : (
             <>
               <PageTitle
@@ -201,7 +222,7 @@ export function Workbench() {
                 subtitle={subtitleFor(workspace, condition, changeDays, stats)}
               />
 
-              <ScanConsole scan={scan} onCancel={cancel} onClear={clear} />
+              <ScanProgressLine scan={scan} onOpenLog={() => setLogOpen(true)} onCancel={cancel} />
 
               {error && !scan.running && (
                 <div className="mt-5 rounded-lg border bg-card p-8 text-center">
@@ -349,6 +370,16 @@ export function Workbench() {
           )}
         </main>
       </div>
+
+      <ScanLogPanel
+        scan={scan}
+        open={logOpen}
+        onClose={() => {
+          setLogOpen(false)
+          if (!scan.running) clear()
+        }}
+        onCancel={cancel}
+      />
 
       {selectedRecord && condition && (
         <PolicyDrawer
@@ -512,7 +543,15 @@ function ConditionSwitcher({
   )
 }
 
-function EmptyState({ onScan, running }: { onScan: (q: string) => void; running: boolean }) {
+function EmptyState({
+  onScan,
+  running,
+  progress,
+}: {
+  onScan: (q: string) => void
+  running: boolean
+  progress?: React.ReactNode
+}) {
   const [query, setQuery] = useState("")
   const suggestions = ["GLP-1 drugs for weight loss", "Continuous glucose monitors", "ABA therapy for autism", "Hepatitis C antivirals"]
 
@@ -557,6 +596,7 @@ function EmptyState({ onScan, running }: { onScan: (q: string) => void; running:
           </button>
         ))}
       </div>
+      <div className="text-left">{progress}</div>
     </div>
   )
 }

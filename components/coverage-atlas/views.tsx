@@ -7,17 +7,36 @@ import {
   CONFIDENCE_LABEL,
   DIRECTION_LABEL,
   FRICTION_LABELS,
+  PROVENANCE_LABEL,
   STATUS_COLOR,
   STATUS_LABEL,
   formatDate,
   frictionColor,
   frictionSpreadWithinStatus,
+  isInferred,
   relativeTime,
   summarize,
   type AtlasPayload,
+  type ChangeEvent,
   type ChangesPayload,
   type CoverageRecord,
 } from "@/lib/atlas"
+import { historyFor } from "@/agent/lib/derive"
+
+/**
+ * How we know a change happened. Three different strengths of claim, and the
+ * badge says which — "we watched this" and "we read about this" should never
+ * look alike.
+ */
+function ProvenanceBadge({ provenance }: { provenance: ChangeEvent["provenance"] }) {
+  const tone =
+    provenance === "observed"
+      ? "bg-accent text-primary"
+      : provenance === "historical"
+        ? "bg-[var(--difference)] text-foreground"
+        : "bg-muted text-muted-foreground"
+  return <span className={`rounded px-1.5 py-0.5 text-[11px] font-medium ${tone}`}>{PROVENANCE_LABEL[provenance]}</span>
+}
 
 /* ------------------------------------------------------------------ matrix */
 
@@ -84,7 +103,14 @@ export function Matrix({ records, onSelect }: { records: CoverageRecord[]; onSel
         <tbody>
           {sorted.map((r) => (
             <tr key={r.state} onClick={() => onSelect(r)} className="cursor-pointer border-t hover:bg-muted/40">
-              <td className="px-4 py-3 font-semibold">{r.stateName}</td>
+              <td className="px-4 py-3 font-semibold">
+                {r.stateName}
+                {isInferred(r) && (
+                  <span className="ml-1.5 rounded bg-muted px-1 py-0.5 text-[9px] font-medium uppercase tracking-wider text-muted-foreground">
+                    unverified
+                  </span>
+                )}
+              </td>
               <td className="px-4 py-3">
                 <span className="flex items-center gap-1.5">
                   <span className="size-2 shrink-0 rounded-sm" style={{ background: STATUS_COLOR[r.status] }} />
@@ -286,7 +312,7 @@ export function Changes({
           [summary?.total ?? 0, "Material changes"],
           [summary?.widened ?? 0, "Access widened"],
           [summary?.tightened ?? 0, "Access tightened"],
-          [summary?.observed ?? 0, "Caught by our own diff"],
+          [(summary?.observed ?? 0) + (summary?.historical ?? 0), "Caught by our own reading"],
         ].map(([n, l]) => (
           <div key={String(l)} className="border-b p-4 last:border-b-0 lg:border-b-0 lg:border-r lg:last:border-r-0">
             <div className="text-xl font-semibold">{n}</div>
@@ -338,11 +364,7 @@ export function Changes({
                   <div className="text-sm font-medium">{e.headline}</div>
                   {e.detail && <div className="mt-1 text-xs leading-5 text-muted-foreground">{e.detail}</div>}
                   <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
-                    <span
-                      className={`rounded px-1.5 py-0.5 font-medium ${e.provenance === "observed" ? "bg-accent text-primary" : "bg-muted"}`}
-                    >
-                      {e.provenance === "observed" ? "Observed by our scanner" : "Publicly reported"}
-                    </span>
+                    <ProvenanceBadge provenance={e.provenance} />
                     <span>Announced {formatDate(e.announcedOn)}</span>
                     {e.effectiveOn && <span>· effective {formatDate(e.effectiveOn)}</span>}
                   </div>
@@ -504,24 +526,157 @@ export function Compare({
             </>
           )}
         </p>
-        {changes && changes.events.some((e) => e.state === a || e.state === b) && (
-          <div className="mt-4 border-t pt-3">
-            <div className="mb-2 text-xs font-semibold">Recent movement in these two</div>
-            <ul className="flex flex-col gap-1.5">
-              {changes.events
-                .filter((e) => e.state === a || e.state === b)
-                .slice(0, 4)
-                .map((e) => (
-                  <li key={e.id} className="text-xs text-muted-foreground">
-                    <strong className="text-foreground">{e.stateName}</strong> — {e.headline}{" "}
-                    <span className="text-[11px]">({formatDate(e.announcedOn)})</span>
-                  </li>
-                ))}
-            </ul>
-          </div>
-        )}
       </div>
+
+      <StateChangeDetail left={left} right={right} changes={changes} />
     </>
+  )
+}
+
+/**
+ * How each of the two states got here.
+ *
+ * The table above answers "how do they differ today". This answers "how did they
+ * get that way", which is often the more useful half — a state that has held the
+ * same rule for three years and a state that tightened it last quarter present
+ * identically in a snapshot and could not be more different to plan around.
+ *
+ * Two tracks per state: the dated policy versions we read out of its own
+ * documents, and the change events attributed to it from any source. Verbatim
+ * language is carried through so a rewrite is visible as a rewrite.
+ */
+function StateChangeDetail({
+  left,
+  right,
+  changes,
+}: {
+  left: CoverageRecord
+  right: CoverageRecord
+  changes: ChangesPayload | null
+}) {
+  const columns = [left, right]
+  const anyMovement = columns.some(
+    (r) => historyFor(r).length > 1 || (changes?.events ?? []).some((e) => e.state === r.state),
+  )
+
+  return (
+    <section className="mt-4 rounded-lg border bg-card">
+      <div className="border-b p-4">
+        <h2 className="text-sm font-semibold">How each state got here</h2>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Dated policy versions read from each state's own documents, and every change event attributed to it. Medicaid
+          publishes no change feed, so each entry says how it was established.
+        </p>
+      </div>
+
+      {!anyMovement ? (
+        <p className="p-8 text-center text-sm text-muted-foreground">
+          No dated movement recorded for either state. Neither one's documents described a prior version, and no
+          announcement was found — which for a stable policy is the correct answer.
+        </p>
+      ) : (
+        <div className="grid md:grid-cols-2">
+          {columns.map((record, i) => {
+            const versions = historyFor(record)
+            const events = (changes?.events ?? []).filter((e) => e.state === record.state)
+            return (
+              <article key={record.state} className={`p-4 ${i === 0 ? "border-b md:border-b-0 md:border-r" : ""}`}>
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="text-sm font-semibold">{record.stateName}</h3>
+                  <span className="text-[11px] text-muted-foreground">
+                    {versions.length} dated version{versions.length === 1 ? "" : "s"} · {events.length} event
+                    {events.length === 1 ? "" : "s"}
+                  </span>
+                </div>
+
+                {versions.length > 1 ? (
+                  <ol className="mt-4 flex flex-col">
+                    {versions.map((v, idx) => (
+                      <li key={`${v.effectiveDate ?? v.documentDate ?? idx}-${idx}`} className="relative pb-4 pl-5 last:pb-0">
+                        <span
+                          className="absolute left-0 top-1 size-2.5 rounded-full ring-2 ring-card"
+                          style={{ background: STATUS_COLOR[v.status] }}
+                        />
+                        {idx < versions.length - 1 && (
+                          <span className="absolute left-[4.5px] top-4 h-full w-px bg-border" aria-hidden />
+                        )}
+                        <div className="flex flex-wrap items-baseline gap-x-2">
+                          <span className="text-xs font-semibold">{STATUS_LABEL[v.status]}</span>
+                          {v.isCurrent && (
+                            <span className="rounded bg-accent px-1.5 py-0.5 text-[10px] font-medium text-primary">
+                              in force
+                            </span>
+                          )}
+                          <span className="text-[11px] text-muted-foreground">
+                            {v.effectiveDate ? `effective ${formatDate(v.effectiveDate)}` : formatDate(v.documentDate)}
+                          </span>
+                        </div>
+                        <div className="mt-0.5 text-[11px] text-muted-foreground">
+                          friction {v.frictionIndex}/100
+                          {v.frictionFlags.length > 0 && ` · ${v.frictionFlags.map((f) => FRICTION_LABELS[f]).join(", ")}`}
+                        </div>
+                        {v.criteriaVerbatim && (
+                          <blockquote className="mt-2 border-l-2 border-border pl-2 text-[11px] italic leading-4 text-muted-foreground">
+                            “{v.criteriaVerbatim.slice(0, 220)}
+                            {v.criteriaVerbatim.length > 220 ? "…" : ""}”
+                          </blockquote>
+                        )}
+                        {!v.criteriaVerbatim && v.criteriaSummary && (
+                          <p className="mt-1 text-[11px] leading-4 text-muted-foreground">{v.criteriaSummary}</p>
+                        )}
+                      </li>
+                    ))}
+                  </ol>
+                ) : (
+                  <p className="mt-3 text-xs leading-5 text-muted-foreground">
+                    Only one dated version found. The scan did not surface a document describing a prior rule for{" "}
+                    {record.stateName}.
+                  </p>
+                )}
+
+                {events.length > 0 && (
+                  <div className="mt-4 border-t pt-3">
+                    <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                      Change events
+                    </div>
+                    <ul className="flex flex-col gap-2.5">
+                      {events.slice(0, 5).map((e) => (
+                        <li key={e.id}>
+                          <div className="flex items-start gap-1.5 text-xs">
+                            {e.frictionDelta < 0 ? (
+                              <TrendingDown className="mt-0.5 size-3.5 shrink-0" style={{ color: "var(--policy-covered)" }} />
+                            ) : (
+                              <TrendingUp className="mt-0.5 size-3.5 shrink-0" style={{ color: "var(--policy-limited)" }} />
+                            )}
+                            <span className="min-w-0 font-medium leading-5">{e.headline}</span>
+                          </div>
+                          {e.detail && <p className="mt-0.5 pl-5 text-[11px] leading-4 text-muted-foreground">{e.detail}</p>}
+                          <div className="mt-1 flex flex-wrap items-center gap-2 pl-5 text-[11px] text-muted-foreground">
+                            <ProvenanceBadge provenance={e.provenance} />
+                            <span>{formatDate(e.announcedOn)}</span>
+                            {e.effectiveOn && <span>· effective {formatDate(e.effectiveOn)}</span>}
+                            {e.sourceUrl && (
+                              <a
+                                href={e.sourceUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="hover:text-primary hover:underline"
+                              >
+                                source
+                              </a>
+                            )}
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </article>
+            )
+          })}
+        </div>
+      )}
+    </section>
   )
 }
 

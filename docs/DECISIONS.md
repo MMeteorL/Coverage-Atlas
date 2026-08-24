@@ -195,7 +195,123 @@ carries `program`, so managed care is an extension rather than a rewrite.
 
 ---
 
-## 12. A hand-written TinyFish client over the documented HTTP endpoints
+## 12. Two ceilings, and finishing early is a legitimate ending
+
+**Decision.** Bound every scan at 200 TinyFish calls and 80 orchestrator steps.
+Stop early, with budget unspent, when every jurisdiction has a timestamped,
+cited answer.
+
+**Why.** A scanner that follows leads out of the pages it reads and keeps digging
+until every gap closes will run forever on a condition whose sources are thin.
+Two ceilings, not one, because they bound different things: calls bound external
+spend and wall-clock, steps bound the *shape* of the work, so a cheap-but-endless
+loop cannot slip past the call cap. And the early stop matters as much as the
+ceilings — a scan that spends its whole budget because the budget was there is
+wasting money on a map that was already finished.
+
+**Cost.** Two numbers to tune per condition, and a condition with genuinely
+scattered sources can hit a ceiling with states unresolved. That is what
+decision 13 is for.
+
+---
+
+## 13. After the cap, infer — and mark it, loudly
+
+**Decision.** Jurisdictions still unresolved when the budget closes are filled
+from the model's own knowledge, as `method: "inferred"`, `review_needed`
+confidence, no source URL, and a note stating what the estimate rests on. The
+matrix labels them *unverified*, the drawer banners them.
+
+**Why.** A grey cell tells a provider nothing at all. A cell reading "probably
+prior authorization, not verified against a source, review before relying on it"
+is genuinely more useful. The entire value of that trade depends on the interface
+never letting the two be confused, so the marking is not decoration — it is the
+condition under which the feature is acceptable.
+
+**Cost.** A record on the map that is not backed by a document, in a product
+whose whole pitch is that every record carries its citation. Fenced off as hard
+as the type system allows: `inferred` is the only `method` value with no source,
+and it is checked explicitly wherever records render.
+
+**Alternative rejected.** Leaving them `unpublished`. Honest, but it conflates
+"this state publishes nothing" with "we ran out of budget", which are completely
+different facts and were being rendered identically.
+
+---
+
+## 14. Record dated policy versions, not just the current rule
+
+**Decision.** Extraction asks for any dated earlier or later version a document
+describes. Those become `history` on the record, and adjacent pairs become change
+events marked `historical`.
+
+**Why.** Snapshot-to-snapshot diffing is the strongest evidence of change, but it
+needs two scans — so a first scan could say nothing about the delta, which is the
+product's entire thesis. Medicaid documents are full of dated self-reference: a
+bulletin announcing a change states the rule it replaces. Reading that turns one
+scan into a timeline.
+
+**Cost.** A larger extraction schema and more completion tokens per state, and
+the versions are only as good as the document's own account of its history. The
+third provenance value exists precisely so this is never passed off as something
+we watched happen.
+
+---
+
+## 15. Bank every URL the scan does not read
+
+**Decision.** Search results not fetched, and outbound links from every page
+fetched — including the wrong pages — go into a scored, deduplicated lead pool
+that the backfill pass spends.
+
+**Why.** State sites are shaped so that the answer is usually one hop from the
+page a search returns. The preferred-drug-list index names no drugs but links to
+the dated PDF that does. Fetching the top result and giving up is how a scanner
+concludes "no published policy" about a state whose policy was one link away.
+Following a banked lead costs a fetch, not a search — the fan-out already paid
+for the page that produced it.
+
+**Cost.** Link harvesting means requesting `links: true` on every fetch, and a
+pool that has to be bounded so it does not grow without limit. Capped at 400
+entries with the weakest dropped.
+
+---
+
+## 16. Backfill batches ten states into one fetch
+
+**Decision.** Each backfill round assembles at most one URL per state across at
+most ten states, and issues them as a single `fetchContents` call.
+
+**Why.** Under a 200-call ceiling, one call per state and one call per ten states
+is the difference between closing the gap list and running out at state twenty.
+
+**Cost.** Attribution has to be done by matching `url`/`final_url` back to the
+state that contributed it, and a batch fails as a batch. Acceptable: per-URL
+failures come back in `errors[]` rather than throwing, so one bad URL does not
+cost the other nine.
+
+---
+
+## 17. One line while scanning, the full log behind a button
+
+**Decision.** During a scan the interface shows a single line — current phase,
+current task, progress — under whatever the user was already looking at. The
+complete agent log lives in a side panel opened from a header button.
+
+**Why.** A console pinned to every page is noise on the four pages that are not
+about scanning, and it competes with the map for exactly the attention the map
+should be getting. While a scan runs the only live question is "what is it doing
+right now, and how far along is it", and that fits on one line. Everything
+else — phase history, budget pressure, the ledger — is diagnostic, wanted
+occasionally, and belongs behind a deliberate click.
+
+**Cost.** The efficiency story (how many states one shared read settled) is no
+longer unmissable; it is one click away. The header button carries a live
+progress count so the panel is discoverable while it still matters.
+
+---
+
+## 18. A hand-written TinyFish client over the documented HTTP endpoints
 
 **Decision.** `agent/lib/tinyfish.ts` calls the documented endpoints directly
 rather than depending on `@tiny-fish/sdk`.
@@ -211,7 +327,7 @@ so the maintenance burden is low.
 
 ---
 
-## 13. Line-buffered SSE parsing on the client
+## 19. Line-buffered SSE parsing on the client
 
 **Decision.** Keep the partial trailing line between chunks rather than splitting
 on `\n\n`.
