@@ -60,7 +60,7 @@ export async function askJson<T>(opts: JsonCallOptions): Promise<T> {
         headers: {
           Authorization: `Bearer ${key}`,
           "Content-Type": "application/json",
-          "HTTP-Referer": "https://github.com/abundance-ai-ml/Coverage-Atlas",
+          "HTTP-Referer": "https://github.com/MMeteorL/Coverage-Atlas",
           "X-Title": "Coverage Atlas",
         },
         body: JSON.stringify({

@@ -28,7 +28,7 @@ at all.
 ## Setup
 
 ```bash
-git clone https://github.com/abundance-ai-ml/Coverage-Atlas.git
+git clone https://github.com/MMeteorL/Coverage-Atlas.git
 cd Coverage-Atlas
 pnpm install
 cp .env.example .env.local     # then fill in the two keys
