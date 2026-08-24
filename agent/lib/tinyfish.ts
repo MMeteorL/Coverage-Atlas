@@ -30,6 +30,42 @@ export type FetchResult = {
   links?: string[]
 }
 
+const MONTHS = "january|february|march|april|may|june|july|august|september|october|november|december"
+
+/**
+ * Coerce whatever a model returned into an ISO date, or null.
+ *
+ * Schemas ask for `YYYY-MM-DD` and models mostly comply, but "January 21, 2026"
+ * gets through often enough to matter — and a non-ISO date poisons every
+ * comparison downstream, because the change feed sorts and windows on these
+ * strings. Normalising once at the boundary is cheaper than defending every
+ * comparison.
+ */
+export function normalizeDate(value: string | null | undefined): string | null {
+  if (!value) return null
+  const text = String(value).trim()
+  const iso = text.match(/^(\d{4})-(\d{2})-(\d{2})/)
+  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`
+
+  const written = text.match(new RegExp(`\\b(${MONTHS})\\s+(\\d{1,2}),?\\s+(\\d{4})\\b`, "i"))
+  if (written) {
+    const month = MONTHS.split("|").indexOf(written[1].toLowerCase()) + 1
+    return `${written[3]}-${String(month).padStart(2, "0")}-${written[2].padStart(2, "0")}`
+  }
+  // Month and year only — assume the first of the month, which is how policy
+  // effective dates are almost always written anyway.
+  const monthYear = text.match(new RegExp(`\\b(${MONTHS})\\s+(\\d{4})\\b`, "i"))
+  if (monthYear) {
+    const month = MONTHS.split("|").indexOf(monthYear[1].toLowerCase()) + 1
+    return `${monthYear[2]}-${String(month).padStart(2, "0")}-01`
+  }
+  const numeric = text.match(/\b(\d{1,2})[./-](\d{1,2})[./-](\d{4})\b/)
+  if (numeric) return `${numeric[3]}-${numeric[1].padStart(2, "0")}-${numeric[2].padStart(2, "0")}`
+  const yearOnly = text.match(/^(20[23]\d)$/)
+  if (yearOnly) return `${yearOnly[1]}-01-01`
+  return null
+}
+
 /** Anything that reads like a date the source is asserting about itself. */
 export function guessDocumentDate(doc: Pick<FetchResult, "text" | "title" | "url">): string | null {
   const haystack = `${doc.title ?? ""} ${doc.url ?? ""} ${(doc.text ?? "").slice(0, 4000)}`

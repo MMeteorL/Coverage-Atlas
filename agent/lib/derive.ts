@@ -10,6 +10,7 @@ import { createHash } from "node:crypto"
 import {
   FRICTION_WEIGHTS,
   PEER_OF,
+  STATE_NAMES,
   type ChangeEvent,
   type CoverageRecord,
   type CoverageStatus,
@@ -183,6 +184,47 @@ export function findOutliers(records: CoverageRecord[], changes: ChangeEvent[]):
   return out.slice(0, 4)
 }
 
+/** How directly a record's evidence came from the jurisdiction's own publication. */
+const EVIDENCE_TIER: Record<CoverageRecord["method"], number> = {
+  inferred: 0,
+  search: 1,
+  carried_forward: 2,
+  baseline: 2,
+  fetch: 3,
+  backfill: 3,
+  agent: 3,
+}
+
+/**
+ * Did we learn something, rather than watch something change?
+ *
+ * This is the difference between "Illinois now requires prior authorization" and
+ * "we finally found Illinois's policy". Both look identical to a naive differ —
+ * the stored status moved — but only one is a policy event, and publishing the
+ * other as an alert is how a scanner destroys its own credibility. A backfill
+ * pass that closes gaps necessarily rewrites records, so without this guard
+ * every improvement to our own coverage is announced as a change in the world.
+ */
+function isKnowledgeGain(was: CoverageRecord, now: CoverageRecord): boolean {
+  if (was.status === "unpublished" && now.status !== "unpublished") return true
+  if (!was.sourceUrl && now.sourceUrl) return true
+  return EVIDENCE_TIER[now.method] > EVIDENCE_TIER[was.method]
+}
+
+/**
+ * A policy change has a date.
+ *
+ * Two readings of the same undated source that disagree are a disagreement
+ * between readings, not a change over time. Requiring a date to have advanced
+ * keeps extraction volatility — the same PDF parsed twice, a different page of
+ * the same formulary — out of a feed users are meant to treat as alerts.
+ */
+function dateAdvanced(was: CoverageRecord, now: CoverageRecord): boolean {
+  const before = was.effectiveDate ?? was.documentDate ?? ""
+  const after = now.effectiveDate ?? now.documentDate ?? ""
+  return after > before
+}
+
 const STATUS_RANK: Record<CoverageStatus, number> = {
   covered: 4,
   conditional: 3,
@@ -215,6 +257,9 @@ export function diffSnapshots(
     const was = prior.get(now.state)
     if (!was) continue
     if (was.status === now.status && Math.abs(now.frictionIndex - was.frictionIndex) < 6) continue
+    // Our own coverage improving is not the world changing.
+    if (isKnowledgeGain(was, now)) continue
+    if (!dateAdvanced(was, now)) continue
 
     const frictionDelta = now.frictionIndex - was.frictionIndex
     const statusMoved = was.status !== now.status
@@ -244,8 +289,11 @@ export function diffSnapshots(
       lost.length ? `Removed: ${lost.join(", ").replace(/_/g, " ")}.` : null,
     ].filter(Boolean)
 
+    // Keyed on the policy's own date, not the scan's, so the same event found by
+    // two different routes collapses into one entry rather than appearing twice.
+    const when = now.effectiveDate ?? now.documentDate ?? detectedAt.slice(0, 10)
     events.push({
-      id: `${now.state}-${direction}-${detectedAt.slice(0, 10)}`,
+      id: `${now.state}-${direction}-${when}`,
       state: now.state,
       stateName: now.stateName,
       direction,
@@ -254,7 +302,10 @@ export function diffSnapshots(
       fromStatus: was.status,
       toStatus: now.status,
       frictionDelta,
-      announcedOn: now.effectiveDate ?? detectedAt.slice(0, 10),
+      // Date the event by the policy, not by when we happened to look. Falling
+      // back to "today" would tell a user a rule changed this morning when the
+      // document we read it from is eight months old.
+      announcedOn: when,
       effectiveOn: now.effectiveDate,
       sourceDoc: now.sourceDoc,
       sourceUrl: now.sourceUrl,
@@ -311,6 +362,27 @@ export function prioritiseGaps(records: CoverageRecord[]): CoverageRecord[] {
 
 /* ---------------------------------------------------------------- history */
 
+/**
+ * Drop versions that a document almost certainly failed to transcribe rather
+ * than described.
+ *
+ * A single source claiming a state removed a set of gates and then re-added the
+ * identical set is describing a transcription gap, not a policy that changed and
+ * changed back. Left in, one such version produces two contradictory events —
+ * "eased by 26 points" and "tightened by 26 points" — which is worse than
+ * reporting nothing.
+ */
+function denoiseHistory(versions: PolicyVersion[]): PolicyVersion[] {
+  if (versions.length < 3) return versions
+  const fingerprint = (v: PolicyVersion) => `${v.status}|${v.frictionFlags.slice().sort().join(",")}`
+  return versions.filter((v, i) => {
+    const before = versions[i - 1]
+    const after = versions[i + 1]
+    if (!before || !after) return true
+    return !(fingerprint(before) === fingerprint(after) && fingerprint(v) !== fingerprint(before))
+  })
+}
+
 /** Chronological, current version last, one entry per (effective date, status). */
 export function sortHistory(versions: PolicyVersion[]): PolicyVersion[] {
   const key = (v: PolicyVersion) => v.effectiveDate ?? v.documentDate ?? ""
@@ -342,7 +414,12 @@ export function changesFromHistory(records: CoverageRecord[], detectedAt: string
   const events: ChangeEvent[] = []
 
   for (const record of records) {
-    const history = sortHistory(record.history ?? [])
+    // Only dated versions can be diffed: two observations you cannot order in
+    // time have no delta between them, and pairing an undated version with a
+    // dated one produces contradictory events on the same day.
+    const history = denoiseHistory(
+      sortHistory((record.history ?? []).filter((v) => v.effectiveDate || v.documentDate)),
+    )
     if (history.length < 2) continue
 
     for (let i = 1; i < history.length; i++) {
@@ -391,7 +468,7 @@ export function changesFromHistory(records: CoverageRecord[], detectedAt: string
         fromStatus: was.status,
         toStatus: now.status,
         frictionDelta,
-        announcedOn: now.documentDate ?? when,
+        announcedOn: now.effectiveDate ?? now.documentDate ?? when,
         effectiveOn: now.effectiveDate,
         sourceDoc: now.sourceDoc,
         sourceUrl: now.sourceUrl,
@@ -408,4 +485,45 @@ export function changesFromHistory(records: CoverageRecord[], detectedAt: string
 export function historyFor(record: CoverageRecord | undefined): PolicyVersion[] {
   if (!record) return []
   return sortHistory(record.history ?? []).reverse()
+}
+
+
+/* ---------------------------------------------------- wrong-state guard */
+
+/**
+ * Is this excerpt actually about the state we asked about?
+ *
+ * Search and lead-following both stray across state lines: a query for
+ * Colorado's criteria surfaces a North Carolina bulletin that happens to rank,
+ * or a state page links out to a neighbour's. The extractor is told "you are
+ * reading Colorado's documents" and will dutifully attribute whatever it finds,
+ * which is how one state's verbatim prior-authorization language ends up quoted
+ * under another's name — the single most damaging error this product can make,
+ * because the quote looks authoritative and is precisely wrong.
+ *
+ * The rule is deliberately permissive: reject only when the target state is
+ * absent *and* some other state is named repeatedly. A document that names no
+ * state at all is usually a formulary table and is fine.
+ */
+export function looksLikeWrongState(excerpt: string, stateCode: string): boolean {
+  const target = STATE_NAMES[stateCode]
+  if (!target) return false
+  const text = excerpt.toLowerCase()
+  if (text.includes(target.toLowerCase())) return false
+
+  // Policy documents refer to themselves by postal code as often as by name —
+  // "NC Medicaid", "TX Vendor Drug Program" — so a name-only check misses the
+  // most common form of the mistake.
+  const abbreviated = new RegExp(`\\b${stateCode}\\b\\s+(medicaid|medicaid|hhs|dhs|dhhs)`, "i")
+  if (abbreviated.test(excerpt)) return false
+
+  for (const [code, name] of Object.entries(STATE_NAMES)) {
+    if (code === stateCode) continue
+    // "Washington" appears inside "Washington, D.C."; require a word boundary.
+    const byName = text.match(new RegExp(`\\b${name.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "g"))
+    if ((byName?.length ?? 0) >= 2) return true
+    // One unambiguous "XX Medicaid" for another state is enough on its own.
+    if (new RegExp(`\\b${code}\\b\\s+(medicaid|medicaid rx|vendor drug)`, "i").test(excerpt)) return true
+  }
+  return false
 }

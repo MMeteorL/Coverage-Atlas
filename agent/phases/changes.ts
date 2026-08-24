@@ -16,7 +16,7 @@
 // timeline entry is something the scanner watched happen or something it read.
 
 import { askJson } from "../lib/llm"
-import { search } from "../lib/tinyfish"
+import { normalizeDate, search } from "../lib/tinyfish"
 import type { Budget } from "../lib/budget"
 import { STATE_NAMES, type ChangeDirection, type ChangeEvent, type ConditionSpec } from "../lib/types"
 
@@ -125,7 +125,7 @@ export async function discoverReportedChanges(
   for (const e of parsed.events) {
     const code = e.state?.toUpperCase().trim()
     if (!code || !STATE_NAMES[code]) continue
-    const announced = e.announcedOn ?? e.effectiveOn ?? detectedAt.slice(0, 10)
+    const announced = normalizeDate(e.announcedOn) ?? normalizeDate(e.effectiveOn) ?? detectedAt.slice(0, 10)
     events.push({
       id: `${code}-${e.direction}-${announced}`,
       state: code,
@@ -137,7 +137,7 @@ export async function discoverReportedChanges(
       toStatus: null,
       frictionDelta: DIRECTION_DELTA[e.direction] ?? 0,
       announcedOn: announced,
-      effectiveOn: e.effectiveOn,
+      effectiveOn: normalizeDate(e.effectiveOn),
       sourceDoc: e.sourceTitle,
       sourceUrl: e.sourceUrl,
       provenance: "reported",

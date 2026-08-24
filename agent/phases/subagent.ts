@@ -22,8 +22,8 @@
 //      the orchestrator holds.
 
 import { askJson } from "../lib/llm"
-import { fetchContents, guessDocumentDate, runAgent, search, unwrapAgentResult } from "../lib/tinyfish"
-import { estimateTokens, frictionIndex, sha256, sortHistory, windowText } from "../lib/derive"
+import { fetchContents, guessDocumentDate, normalizeDate, runAgent, search, unwrapAgentResult } from "../lib/tinyfish"
+import { estimateTokens, frictionIndex, looksLikeWrongState, sha256, sortHistory, windowText } from "../lib/derive"
 import type { Budget } from "../lib/budget"
 import type { LeadPool } from "../lib/leads"
 import {
@@ -165,8 +165,8 @@ function toVersion(
     frictionIndex: frictionIndex(status, flags),
     criteriaSummary: e.criteriaSummary ?? null,
     criteriaVerbatim: e.criteriaVerbatim ?? null,
-    effectiveDate: e.effectiveDate,
-    documentDate: meta.documentDate,
+    effectiveDate: normalizeDate(e.effectiveDate),
+    documentDate: normalizeDate(meta.documentDate),
     sourceDoc: meta.sourceDoc,
     sourceUrl: meta.sourceUrl,
     isCurrent: meta.isCurrent,
@@ -199,10 +199,11 @@ export function toRecord(
       ? "prior_authorization"
       : "none"
   const friction = frictionIndex(status, flags)
-  const documentDate = e.documentDate ?? null
+  const documentDate = normalizeDate(e.documentDate)
+  const effectiveDate = normalizeDate(e.effectiveDate)
 
   const current = toVersion(
-    { status, frictionFlags: flags, effectiveDate: e.effectiveDate, criteriaSummary: e.criteriaSummary, criteriaVerbatim: e.criteriaVerbatim },
+    { status, frictionFlags: flags, effectiveDate, criteriaSummary: e.criteriaSummary, criteriaVerbatim: e.criteriaVerbatim },
     { documentDate, sourceDoc: meta.sourceDoc, sourceUrl: meta.sourceUrl, isCurrent: true },
   )
   // Dated versions the source described other than the one in force. These are
@@ -231,7 +232,7 @@ export function toRecord(
     administeringEntity: e.administeringEntity,
     sourceDoc: meta.sourceDoc,
     sourceUrl: meta.sourceUrl,
-    effectiveDate: e.effectiveDate,
+    effectiveDate,
     confidence: e.confidence,
     method: meta.method,
     lastCheckedAt: new Date().toISOString(),
@@ -290,6 +291,11 @@ export async function runSubagent(input: SubagentInput): Promise<SubagentOutcome
         const windowed = windowText(text, terms, { radius: 900, maxWindows: 6 })
         // A page that never mentions the drug is the wrong page, not a "not covered" answer.
         if (windowed.length < 300 || !terms.some((t) => windowed.toLowerCase().includes(t))) continue
+        // ...and a page about a different state is worse than no page at all.
+        if (looksLikeWrongState(windowed, state)) {
+          input.onProgress?.(`${state}: discarded a source that is about a different state`)
+          continue
+        }
         excerpt = windowed
         sourceUrl = doc.final_url ?? doc.url
         sourceDoc = doc.title ?? null
@@ -380,6 +386,8 @@ export async function runSubagent(input: SubagentInput): Promise<SubagentOutcome
           `unpublished = the excerpt does not establish a policy.\n\n` +
           `frictionFlags: only gates the excerpt actually states. Do not infer. An empty array is a real answer.\n` +
           `criteriaVerbatim: exact characters from the excerpt, under 400 characters, or null.\n` +
+          `If the excerpt turns out to describe a DIFFERENT state's policy, set found=false. Never attribute another ` +
+          `state's criteria to ${stateName}.\n` +
           `effectiveDate: when the CURRENT policy took effect. documentDate: when this document was published or revised.\n` +
           `otherVersions: any DATED earlier or later version of this state's policy the excerpt describes — a bulletin ` +
           `announcing a change usually states what the rule was before it, and a superseded list carries the date it ` +

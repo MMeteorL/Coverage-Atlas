@@ -12,7 +12,7 @@
 // never happened, and a scanner that cries wolf is worse than no scanner.
 
 import { askJson } from "../lib/llm"
-import { fetchContents } from "../lib/tinyfish"
+import { fetchContents, normalizeDate } from "../lib/tinyfish"
 import { estimateTokens, sha256 } from "../lib/derive"
 import { STATE_NAMES, type ConditionSpec, type CoverageRecord, type DiscoveredSource } from "../lib/types"
 import type { Budget } from "../lib/budget"
@@ -134,7 +134,7 @@ export async function buildBaseline(
         ...row,
         state: code,
         frictionFlags: (row.frictionFlags ?? []).filter((f) => (FLAGS as readonly string[]).includes(f)),
-        effectiveDate: row.effectiveDate ?? parsed.documentDate,
+        effectiveDate: normalizeDate(row.effectiveDate) ?? normalizeDate(parsed.documentDate),
         sourceDoc: source.title,
         sourceUrl: source.url,
       })

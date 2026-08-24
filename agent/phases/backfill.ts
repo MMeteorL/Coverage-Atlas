@@ -26,7 +26,7 @@
 
 import { askJson } from "../lib/llm"
 import { fetchContents, guessDocumentDate, search } from "../lib/tinyfish"
-import { estimateTokens, frictionIndex, gapsFor, prioritiseGaps, sha256, windowText } from "../lib/derive"
+import { estimateTokens, frictionIndex, gapsFor, looksLikeWrongState, prioritiseGaps, sha256, windowText } from "../lib/derive"
 import type { Budget } from "../lib/budget"
 import type { LeadPool } from "../lib/leads"
 import { STATE_NAMES, type ConditionSpec, type CoverageRecord, type RecordGap } from "../lib/types"
@@ -172,6 +172,12 @@ export async function backfill(input: BackfillInput): Promise<BackfillOutcome> {
       out.naiveTokens += estimateTokens(text)
       const windowed = windowText(text, terms, { radius: 900, maxWindows: 6 })
       if (windowed.length < 300 || !terms.some((t) => windowed.toLowerCase().includes(t))) continue
+      // Leads stray across state lines more often than search does, because a
+      // state page will happily link to a neighbour's bulletin.
+      if (looksLikeWrongState(windowed, entry.state)) {
+        input.onProgress?.(`${entry.state}: discarded a lead that is about a different state`)
+        continue
+      }
 
       try {
         const parsed = await askJson<Extraction>({
@@ -191,6 +197,8 @@ export async function backfill(input: BackfillInput): Promise<BackfillOutcome> {
             `unpublished (this excerpt establishes no policy).\n` +
             `frictionFlags: only gates the excerpt states. Do not infer.\n` +
             `criteriaVerbatim: exact characters, under 400, or null.\n` +
+            `If this excerpt describes a DIFFERENT state's policy, set found=false. Never attribute another state's ` +
+            `criteria to ${stateName}.\n` +
             `otherVersions: DATED earlier or later versions of this policy the excerpt describes. This excerpt was ` +
             `chosen because it may be a dated bulletin or a superseded list, so capture every dated version it names — ` +
             `that is the point of reading it.\n` +
