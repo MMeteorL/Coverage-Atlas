@@ -154,6 +154,44 @@ writes any disagreement to the change feed as an observed event.
 Snapshots accumulate; nothing prunes them. They are small and they are the entire
 history, so keep them.
 
+## Deploying
+
+The app deploys to Vercel as a standard Next.js project, with three things worth
+knowing.
+
+**The committed data ships with it.** `data/` is read at request time through a
+path built from `process.cwd()`, which the bundler cannot see. `next.config.mjs`
+declares `outputFileTracingIncludes` for `./data/**/*` so the snapshots travel
+into the serverless bundle — without it the atlas deploys as an empty map that
+works perfectly in dev and 404s in production.
+
+**Writes are ephemeral in production.** Serverless filesystems are read-only
+apart from `/tmp`. The store detects this and layers a writable overlay at
+`/tmp/coverage-atlas-data`: reads check the overlay first and fall back to the
+committed bundle, so a scan run against a deployment streams live and stays
+visible until the instance recycles. The scan log says so in its first line
+rather than letting anyone discover it after a five-minute run. Override the
+location with `COVERAGE_ATLAS_DATA_DIR`.
+
+**Scans need a long function timeout.** `/api/scan` declares
+`maxDuration = 800`, but the platform's own ceiling wins: Vercel Hobby caps
+function duration well below a full scan, so a scan started from a Hobby
+deployment will be cut off partway. Two options — deploy on a plan that allows
+long-running functions, or treat the deployment as read-only and produce
+snapshots locally:
+
+```bash
+pnpm scan "<condition>"     # locally, no timeout
+git add data && git commit && git push
+```
+
+The deployed atlas then serves the new snapshot with no infrastructure at all.
+For a demo this is usually the right shape: scanning is the thing you show live
+on your own machine, and the deployment is the thing you send people.
+
+Set `TINYFISH_API_KEY` and `OPENROUTER_API_KEY` in the project's environment
+variables if you want scanning to work at all in production.
+
 ## Troubleshooting
 
 **`TINYFISH_API_KEY is not set` / `OPENROUTER_API_KEY is not set`**
@@ -207,3 +245,20 @@ dev-server startup is painful.
 
 **Nothing renders and the console shows a data path error**
 `data/` is resolved from `process.cwd()`. Run commands from the repository root.
+
+**`ERR_PNPM_LOCKFILE_CONFIG_MISMATCH` on deploy**
+The lockfile's recorded settings disagree with `package.json`. Usually a `pnpm`
+field the local pnpm ignores but the deploy host's older pnpm reads. `package.json`
+pins `packageManager` so both ends resolve identically; if you change pnpm
+versions, run `pnpm install` and commit the lockfile in the same change.
+
+**A deployed atlas is empty but dev works**
+`data/` did not make it into the serverless bundle. Check
+`outputFileTracingIncludes` in `next.config.mjs`, and confirm after a build with:
+
+```bash
+grep -c "/data/" .next/server/app/api/atlas/route.js.nft.json
+```
+
+**A scan on a deployment stops partway**
+The platform's function timeout, not ours. See [Deploying](#deploying).

@@ -3,6 +3,14 @@ const nextConfig = {
   typescript: {
     ignoreBuildErrors: true,
   },
+
+  // The snapshot store reads data/ at request time through a path built from
+  // process.cwd(), which the bundler cannot see and therefore will not ship.
+  // Without this the atlas deploys as an empty map: every read route 404s in
+  // production while working perfectly in dev.
+  outputFileTracingIncludes: {
+    '/api/**': ['./data/**/*'],
+  },
   images: {
     unoptimized: true,
   },

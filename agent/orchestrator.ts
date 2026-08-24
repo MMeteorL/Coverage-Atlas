@@ -43,6 +43,7 @@ import {
   readSnapshot,
   saveCondition,
   writeSnapshot,
+  writesAreEphemeral,
 } from "./lib/store"
 import {
   STATES,
@@ -133,6 +134,16 @@ export async function scan(opts: ScanOptions): Promise<{ snapshot: Snapshot; led
   try {
     // Phase 0 — resolve. A saved condition skips the model call entirely.
     budget.spendStep()
+    if (writesAreEphemeral) {
+      // Say this up front rather than letting someone discover it after a
+      // five-minute scan: on a serverless host the only writable path is /tmp,
+      // so results live for the life of the instance and no longer.
+      emit({
+        type: "phase",
+        phase: "resolve",
+        note: "This host has a read-only filesystem — results will show live but are not persisted beyond this instance",
+      })
+    }
     emit({ type: "phase", phase: "resolve", note: `Interpreting "${opts.condition}"` })
     const saved = (await getCondition(opts.condition)) ?? (await matchSaved(opts.condition))
     const spec = saved ?? (await resolveCondition(opts.condition))
@@ -448,21 +459,30 @@ function unpublishedRecord(code: string, treatmentClass: string): CoverageRecord
 export function ledgerSummary(run: RunLedger): string {
   const saved = run.naivePromptTokensEstimate - run.promptTokens
   const ratio = run.promptTokens > 0 ? run.naivePromptTokensEstimate / run.promptTokens : 0
+  // Ledgers written before budgets existed have no `budget`; the run log is an
+  // append-only file that outlives schema changes, so read it defensively.
+  const budget = run.budget ?? {
+    tinyfishCalls: run.tinyfishSearches + run.tinyfishFetches + run.tinyfishAgentRuns,
+    maxTinyfishCalls: 0,
+    steps: 0,
+    maxSteps: 0,
+    stoppedBecause: "complete" as const,
+  }
   const stopped =
-    run.budget.stoppedBecause === "complete"
+    budget.stoppedBecause === "complete"
       ? "every jurisdiction answered"
-      : run.budget.stoppedBecause === "call_cap"
+      : budget.stoppedBecause === "call_cap"
         ? "TinyFish call ceiling reached"
         : "orchestrator step ceiling reached"
   return [
     `run ${run.runId} · ${(run.durationMs / 1000).toFixed(1)}s · stopped because ${stopped}`,
-    `budget: ${run.budget.tinyfishCalls}/${run.budget.maxTinyfishCalls} tinyfish calls, ${run.budget.steps}/${run.budget.maxSteps} steps`,
+    `budget: ${budget.tinyfishCalls}/${budget.maxTinyfishCalls || "?"} tinyfish calls, ${budget.steps}/${budget.maxSteps || "?"} steps`,
     `tinyfish: ${run.tinyfishSearches} searches, ${run.tinyfishFetches} fetches, ${run.tinyfishAgentRuns} agent runs`,
     `llm: ${run.llmCalls} calls, ${run.promptTokens.toLocaleString()} prompt + ${run.completionTokens.toLocaleString()} completion tokens`,
     `  smart=${modelFor("smart")}  cheap=${modelFor("cheap")}`,
     `plan: ${run.statesFromBaseline} from baseline, ${run.statesShortCircuited} short-circuited, ${run.statesEscalated} escalated to browser`,
-    `gaps: ${run.statesBackfilled} closed by backfill, ${run.statesInferred} inferred after the budget closed`,
-    `history: ${run.historicalChanges} change events derived from dated versions found in this scan`,
+    `gaps: ${run.statesBackfilled ?? 0} closed by backfill, ${run.statesInferred ?? 0} inferred after the budget closed`,
+    `history: ${run.historicalChanges ?? 0} change events derived from dated versions found in this scan`,
     `saved ~${saved.toLocaleString()} prompt tokens vs a whole-document-per-state loop (${ratio.toFixed(1)}x)`,
     run.errors.length ? `errors: ${run.errors.length}` : "no errors",
   ].join("\n")

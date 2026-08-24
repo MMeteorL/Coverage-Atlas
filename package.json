@@ -2,6 +2,7 @@
   "name": "coverage-atlas",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "pnpm@11.5.1",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -36,11 +37,6 @@
     "tailwindcss": "^4.3.3",
     "tsx": "^4.23.12",
     "typescript": "5.7.3"
-  },
-  "pnpm": {
-    "overrides": {
-      "hono": "4.12.25"
-    }
   },
   "description": "A live 50-state scan of Medicaid coverage policy, built on TinyFish primitives."
 }

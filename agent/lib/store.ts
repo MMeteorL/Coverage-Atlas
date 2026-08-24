@@ -2,35 +2,91 @@
 //
 // Deltas are the product, so history has to be first-class rather than a
 // mutable "current" row that overwrites what it replaces. Every scan appends a
-// file; the differ reads two of them. It is also the cheapest possible way to
-// ship a demo that opens with complete data — the seed scan is committed.
+// file; the differ reads two. It is also the cheapest possible way to ship a
+// demo that opens with complete data — the seed scan is committed.
+//
+// Two directories, because serverless hosts ship the repository read-only and
+// give you exactly one writable path:
+//
+//   BUNDLED   the committed data/ directory. Always readable, and on Vercel
+//             always read-only. This is what makes a fresh deployment open with
+//             a full fifty-one-state atlas and a populated change feed.
+//   WRITABLE  where new scans land. The same directory locally; /tmp on a
+//             serverless host, where it survives for the life of the instance
+//             and no longer.
+//
+// Reads check the writable overlay first and fall back to the bundle, so a scan
+// run against a deployment is visible immediately and simply ages out. That is
+// the honest behaviour for a demo: better than refusing to scan, and better
+// than pretending the result was persisted.
 
 import { mkdir, readFile, readdir, writeFile, appendFile } from "node:fs/promises"
 import path from "node:path"
-import type { ChangeEvent, ConditionSpec, RunLedger, Snapshot } from "./types"
+import type { ChangeEvent, ConditionSpec, CoverageRecord, RunLedger, Snapshot } from "./types"
 
 export const DATA_DIR = path.join(process.cwd(), "data")
-const conditionsFile = () => path.join(DATA_DIR, "conditions.json")
-const snapshotDir = (slug: string) => path.join(DATA_DIR, "snapshots", slug)
-const changesFile = (slug: string) => path.join(DATA_DIR, "changes", `${slug}.json`)
-const runsFile = () => path.join(DATA_DIR, "runs.jsonl")
 
-async function readJson<T>(file: string, fallback: T): Promise<T> {
-  try {
-    return JSON.parse(await readFile(file, "utf8")) as T
-  } catch {
-    return fallback
+/** Serverless filesystems are read-only apart from /tmp. */
+const isServerless = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME)
+
+export const WRITABLE_DIR =
+  process.env.COVERAGE_ATLAS_DATA_DIR ?? (isServerless ? "/tmp/coverage-atlas-data" : DATA_DIR)
+
+/** True when writes land somewhere that does not survive the instance. */
+export const writesAreEphemeral = WRITABLE_DIR !== DATA_DIR
+
+const CONDITIONS = "conditions.json"
+const RUNS = "runs.jsonl"
+const snapshotRel = (slug: string) => path.join("snapshots", slug)
+const changesRel = (slug: string) => path.join("changes", `${slug}.json`)
+
+/** Overlay first, bundle second. */
+async function readJson<T>(rel: string, fallback: T): Promise<T> {
+  for (const base of writesAreEphemeral ? [WRITABLE_DIR, DATA_DIR] : [DATA_DIR]) {
+    try {
+      return JSON.parse(await readFile(path.join(base, rel), "utf8")) as T
+    } catch {
+      /* try the next layer */
+    }
   }
+  return fallback
 }
 
-async function writeJson(file: string, value: unknown): Promise<void> {
+async function writeJson(rel: string, value: unknown): Promise<void> {
+  const file = path.join(WRITABLE_DIR, rel)
   await mkdir(path.dirname(file), { recursive: true })
   await writeFile(file, JSON.stringify(value, null, 2) + "\n", "utf8")
 }
 
+/** Union of both layers, deduplicated. */
+async function listDir(rel: string): Promise<string[]> {
+  const seen = new Set<string>()
+  for (const base of writesAreEphemeral ? [DATA_DIR, WRITABLE_DIR] : [DATA_DIR]) {
+    try {
+      for (const entry of await readdir(path.join(base, rel))) seen.add(entry)
+    } catch {
+      /* layer may not exist yet */
+    }
+  }
+  return [...seen]
+}
+
 export async function listConditions(): Promise<ConditionSpec[]> {
-  const all = await readJson<ConditionSpec[]>(conditionsFile(), [])
-  return all.sort((a, b) => Number(b.builtIn) - Number(a.builtIn) || a.name.localeCompare(b.name))
+  const bundled = await readJsonFrom<ConditionSpec[]>(DATA_DIR, CONDITIONS, [])
+  const overlay = writesAreEphemeral ? await readJsonFrom<ConditionSpec[]>(WRITABLE_DIR, CONDITIONS, []) : []
+  const byslug = new Map(bundled.map((c) => [c.slug, c]))
+  for (const c of overlay) byslug.set(c.slug, c)
+  return [...byslug.values()].sort(
+    (a, b) => Number(b.builtIn) - Number(a.builtIn) || a.name.localeCompare(b.name),
+  )
+}
+
+async function readJsonFrom<T>(base: string, rel: string, fallback: T): Promise<T> {
+  try {
+    return JSON.parse(await readFile(path.join(base, rel), "utf8")) as T
+  } catch {
+    return fallback
+  }
 }
 
 export async function getCondition(slug: string): Promise<ConditionSpec | null> {
@@ -39,43 +95,39 @@ export async function getCondition(slug: string): Promise<ConditionSpec | null> 
 
 /** Saving is idempotent: rescanning a condition updates its spec, never duplicates it. */
 export async function saveCondition(spec: ConditionSpec): Promise<ConditionSpec> {
-  const all = await readJson<ConditionSpec[]>(conditionsFile(), [])
+  const all = await listConditions()
   const at = all.findIndex((c) => c.slug === spec.slug)
   if (at >= 0) all[at] = { ...all[at], ...spec, createdAt: all[at].createdAt }
   else all.push(spec)
-  await writeJson(conditionsFile(), all)
+  await writeJson(CONDITIONS, all)
   return spec
 }
 
 /** Built-in conditions are the demo's floor and cannot be removed. */
 export async function deleteCondition(slug: string): Promise<boolean> {
-  const all = await readJson<ConditionSpec[]>(conditionsFile(), [])
+  const all = await listConditions()
   const target = all.find((c) => c.slug === slug)
   if (!target || target.builtIn) return false
-  await writeJson(conditionsFile(), all.filter((c) => c.slug !== slug))
+  await writeJson(CONDITIONS, all.filter((c) => c.slug !== slug))
   return true
+}
+
+/** File-name form of an instant: `2026-08-23T18:45:12.345Z` -> `2026-08-23T18-45-12-345Z`. */
+export function toStamp(iso: string): string {
+  return iso.replace(/[:.]/g, "-")
 }
 
 /** Snapshot file names are ISO timestamps, so lexical order is chronological order. */
 export async function listSnapshotStamps(slug: string): Promise<string[]> {
-  try {
-    const files = await readdir(snapshotDir(slug))
-    return files.filter((f) => f.endsWith(".json")).map((f) => f.replace(/\.json$/, "")).sort()
-  } catch {
-    return []
-  }
+  const files = await listDir(snapshotRel(slug))
+  return files.filter((f) => f.endsWith(".json")).map((f) => f.replace(/\.json$/, "")).sort()
 }
 
 export async function readSnapshot(slug: string, stamp?: string): Promise<Snapshot | null> {
   const stamps = await listSnapshotStamps(slug)
   if (stamps.length === 0) return null
   const pick = stamp && stamps.includes(stamp) ? stamp : stamps[stamps.length - 1]
-  return readJson<Snapshot | null>(path.join(snapshotDir(slug), `${pick}.json`), null)
-}
-
-/** File-name form of an instant: `2026-08-23T18:45:12.345Z` -> `2026-08-23T18-45-12-345Z`. */
-export function toStamp(iso: string): string {
-  return iso.replace(/[:.]/g, "-")
+  return readJson<Snapshot | null>(path.join(snapshotRel(slug), `${pick}.json`), null)
 }
 
 /**
@@ -97,8 +149,8 @@ export async function readSnapshotAsOf(slug: string, at: string): Promise<Snapsh
 }
 
 export async function writeSnapshot(snapshot: Snapshot): Promise<string> {
-  const stamp = snapshot.scannedAt.replace(/[:.]/g, "-")
-  await writeJson(path.join(snapshotDir(snapshot.conditionSlug), `${stamp}.json`), snapshot)
+  const stamp = toStamp(snapshot.scannedAt)
+  await writeJson(path.join(snapshotRel(snapshot.conditionSlug), `${stamp}.json`), snapshot)
   return stamp
 }
 
@@ -110,23 +162,20 @@ export async function writeSnapshot(snapshot: Snapshot): Promise<string> {
  * so it belongs in the current snapshot rather than opening a new one — a
  * fifty-first snapshot containing one refreshed state would corrupt the differ.
  */
-export async function patchLatestRecord(
-  slug: string,
-  record: import("./types").CoverageRecord,
-): Promise<Snapshot | null> {
+export async function patchLatestRecord(slug: string, record: CoverageRecord): Promise<Snapshot | null> {
   const stamps = await listSnapshotStamps(slug)
   if (stamps.length === 0) return null
   const stamp = stamps[stamps.length - 1]
-  const file = path.join(snapshotDir(slug), `${stamp}.json`)
-  const snapshot = await readJson<Snapshot | null>(file, null)
+  const rel = path.join(snapshotRel(slug), `${stamp}.json`)
+  const snapshot = await readJson<Snapshot | null>(rel, null)
   if (!snapshot) return null
   snapshot.records = snapshot.records.map((r) => (r.state === record.state ? record : r))
-  await writeJson(file, snapshot)
+  await writeJson(rel, snapshot)
   return snapshot
 }
 
 export async function readChanges(slug: string): Promise<ChangeEvent[]> {
-  return readJson<ChangeEvent[]>(changesFile(slug), [])
+  return readJson<ChangeEvent[]>(changesRel(slug), [])
 }
 
 /**
@@ -140,20 +189,23 @@ export async function mergeChanges(slug: string, incoming: ChangeEvent[]): Promi
   const merged = [...byKey.values()].sort((a, b) =>
     (b.announcedOn ?? b.detectedAt).localeCompare(a.announcedOn ?? a.detectedAt),
   )
-  await writeJson(changesFile(slug), merged)
+  await writeJson(changesRel(slug), merged)
   return merged
 }
 
 export async function appendRun(ledger: RunLedger): Promise<void> {
-  await mkdir(DATA_DIR, { recursive: true })
-  await appendFile(runsFile(), JSON.stringify(ledger) + "\n", "utf8")
+  await mkdir(WRITABLE_DIR, { recursive: true })
+  await appendFile(path.join(WRITABLE_DIR, RUNS), JSON.stringify(ledger) + "\n", "utf8")
 }
 
 export async function readRuns(limit = 40): Promise<RunLedger[]> {
-  try {
-    const lines = (await readFile(runsFile(), "utf8")).trim().split("\n").filter(Boolean)
-    return lines.slice(-limit).map((l) => JSON.parse(l) as RunLedger).reverse()
-  } catch {
-    return []
+  const lines: string[] = []
+  for (const base of writesAreEphemeral ? [DATA_DIR, WRITABLE_DIR] : [DATA_DIR]) {
+    try {
+      lines.push(...(await readFile(path.join(base, RUNS), "utf8")).trim().split("\n").filter(Boolean))
+    } catch {
+      /* layer may not exist yet */
+    }
   }
+  return lines.slice(-limit).map((l) => JSON.parse(l) as RunLedger).reverse()
 }

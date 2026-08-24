@@ -112,7 +112,9 @@ export function ScanLogPanel({
   const ledger = scan.ledger
   const saved = ledger ? ledger.naivePromptTokensEstimate - ledger.promptTokens : 0
   const ratio = ledger && ledger.promptTokens > 0 ? ledger.naivePromptTokensEstimate / ledger.promptTokens : 0
-  const budget = scan.budget ?? (ledger ? { ...ledger.budget } : null)
+  // A ledger from before budgets existed has none; the panel renders history too.
+  const budget = scan.budget ?? (ledger?.budget ? { ...ledger.budget } : null)
+  const stopReason = ledger?.budget?.stoppedBecause
 
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-foreground/20" onClick={onClose}>
@@ -194,8 +196,8 @@ export function ScanLogPanel({
               />
               <Tile
                 label="Gaps closed"
-                value={`${ledger.statesBackfilled}`}
-                note={ledger.statesInferred > 0 ? `${ledger.statesInferred} inferred` : "none inferred"}
+                value={`${ledger.statesBackfilled ?? 0}`}
+                note={(ledger.statesInferred ?? 0) > 0 ? `${ledger.statesInferred} inferred` : "none inferred"}
               />
             </div>
             <div className="flex items-start gap-2.5 px-4 py-3 text-xs">
@@ -203,11 +205,11 @@ export function ScanLogPanel({
               <p className="leading-5 text-muted-foreground">
                 Stopped because{" "}
                 <strong className="text-foreground">
-                  {ledger.budget.stoppedBecause === "complete"
-                    ? "every jurisdiction was answered"
-                    : ledger.budget.stoppedBecause === "call_cap"
-                      ? "the TinyFish call ceiling was reached"
-                      : "the orchestrator step ceiling was reached"}
+                  {stopReason === "call_cap"
+                    ? "the TinyFish call ceiling was reached"
+                    : stopReason === "step_cap"
+                      ? "the orchestrator step ceiling was reached"
+                      : "every jurisdiction was answered"}
                 </strong>
                 .{" "}
                 {ratio > 1 && (
@@ -216,7 +218,7 @@ export function ScanLogPanel({
                     loop — about {saved.toLocaleString()} prompt tokens not spent.{" "}
                   </>
                 )}
-                {ledger.historicalChanges > 0 &&
+                {(ledger.historicalChanges ?? 0) > 0 &&
                   `${ledger.historicalChanges} change events came from dated versions found during this scan.`}
               </p>
             </div>
