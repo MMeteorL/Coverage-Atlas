@@ -1,11 +1,11 @@
 "use client"
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import Image from "next/image"
 import {
   Activity,
   Bookmark,
   GitCompareArrows,
-  Layers3,
   Loader2,
   Map as MapIcon,
   Play,
@@ -105,13 +105,13 @@ export function Workbench() {
   return (
     <div className="min-h-screen min-w-[680px] bg-background text-foreground">
       <aside className="fixed inset-y-0 left-0 z-30 w-56 border-r bg-sidebar">
-        <div className="flex h-16 items-center gap-3 border-b px-5">
-          <div className="flex size-8 items-center justify-center rounded-md bg-primary text-primary-foreground">
-            <Layers3 className="size-4" />
-          </div>
-          <div>
+        <div className="flex h-16 items-center gap-2.5 border-b px-5">
+          {/* The mark carries its own colour, so it sits on the surface rather
+              than inside a tinted tile the way a monochrome glyph would. */}
+          <Image src="/tinyfish-mark.svg" alt="" width={34} height={34} className="size-[34px] shrink-0" priority />
+          <div className="min-w-0">
             <div className="font-semibold tracking-tight">Coverage Atlas</div>
-            <div className="text-[11px] text-muted-foreground">Medicaid policy intelligence</div>
+            <div className="truncate text-[11px] text-muted-foreground">Medicaid policy intelligence</div>
           </div>
         </div>
 
@@ -137,15 +137,26 @@ export function Workbench() {
           ))}
         </nav>
 
-        <div className="absolute inset-x-3 bottom-4 rounded-md border bg-background p-3">
-          <div className="mb-1 flex items-center gap-2 text-xs font-medium">
-            <Sparkles className="size-3.5 text-primary" />
-            Live-scraped, not curated
+        <div className="absolute inset-x-3 bottom-4 flex flex-col gap-2.5">
+          <div className="rounded-md border bg-background p-3">
+            <div className="mb-1 flex items-center gap-2 text-xs font-medium">
+              <Sparkles className="size-3.5 text-primary" />
+              Live-scraped, not curated
+            </div>
+            <p className="text-[11px] leading-4 text-muted-foreground">
+              Every record carries the source it was read from. Verify against the state's official publication before
+              acting.
+            </p>
           </div>
-          <p className="text-[11px] leading-4 text-muted-foreground">
-            Every record carries the source it was read from. Verify against the state's official publication before
-            acting.
-          </p>
+          <a
+            href="https://tinyfish.ai"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-2 px-1 opacity-75 transition-opacity hover:opacity-100"
+          >
+            <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Built on</span>
+            <Image src="/tinyfish-wordmark.svg" alt="TinyFish" width={70} height={16} className="h-[15px] w-auto" />
+          </a>
         </div>
       </aside>
 

@@ -273,6 +273,17 @@ data/                   snapshots, change feeds, run ledger — committed
 docs/                   architecture · agent · data model · API · operations · decisions
 ```
 
+## Branding
+
+The fish mark and wordmark in `public/` and `app/icon.png` are TinyFish's, taken
+from [docs.tinyfish.ai](https://docs.tinyfish.ai/) and used here because this is
+built on TinyFish for TinyFish. They are their marks, not this project's — if you
+fork this for something else, swap them out.
+
+`public/tinyfish-mark.svg` is the fish extracted from the horizontal lockup so it
+can stand alone at small sizes; `public/tinyfish-wordmark.svg` is the full
+lockup, black-text variant, for light backgrounds.
+
 ## Scope
 
 Medicaid **fee-for-service** only. Managed-care plans may apply their own

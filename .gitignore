@@ -16,3 +16,6 @@ node_modules
 # local secrets
 .env.local
 .env*.local
+
+# typescript incremental build cache
+*.tsbuildinfo

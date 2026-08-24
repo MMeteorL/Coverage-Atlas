@@ -8,7 +8,13 @@ const geistMono = Geist_Mono({ subsets: ["latin"], variable: "--font-geist-mono"
 
 export const metadata: Metadata = {
   title: "Coverage Atlas | Medicaid Policy Intelligence",
-  description: "Compare Medicaid coverage, access requirements, reimbursement, and policy changes across all 50 states.",
+  description:
+    "Name a condition and see how all 50 states cover it — status, access friction, verbatim criteria, and what changed. Live-scanned on TinyFish.",
+  openGraph: {
+    title: "Coverage Atlas",
+    description: "Name a condition. See how all fifty states cover it, and what changed.",
+    type: "website",
+  },
 }
 
 export const viewport: Viewport = {
