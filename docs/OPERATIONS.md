@@ -246,6 +246,18 @@ dev-server startup is painful.
 **Nothing renders and the console shows a data path error**
 `data/` is resolved from `process.cwd()`. Run commands from the repository root.
 
+**`ERR_PNPM_IGNORED_BUILDS` on deploy**
+pnpm will not run a dependency's install scripts unless told to, and on a clean
+CI install it errors rather than warning. Every package with a build script has
+to be decided explicitly in `pnpm-workspace.yaml` — "no" as deliberately as
+"yes". Note the spelling differs by pnpm major: `allowBuilds` (11) versus
+`onlyBuiltDependencies` / `ignoredBuiltDependencies` (10); the file carries both.
+To add a package, let pnpm write it rather than hand-editing:
+
+```bash
+pnpm approve-builds <pkg> '!<pkg-to-deny>'
+```
+
 **`ERR_PNPM_LOCKFILE_CONFIG_MISMATCH` on deploy**
 The lockfile's recorded settings disagree with `package.json`. Usually a `pnpm`
 field the local pnpm ignores but the deploy host's older pnpm reads. `package.json`
