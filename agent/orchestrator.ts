@@ -191,7 +191,7 @@ export async function scan(opts: ScanOptions): Promise<{ snapshot: Snapshot; led
           run.tinyfishSearches += out.searches
           run.tinyfishFetches += out.fetches
           run.tinyfishAgentRuns += out.agentRuns
-          run.naivePromptTokensEstimate += out.naiveTokens * 1 // one whole-doc read per state
+          run.naivePromptTokensEstimate += out.naiveTokens
           if (out.shortCircuited) run.statesShortCircuited++
           if (out.agentRuns > 0) run.statesEscalated++
         } else {

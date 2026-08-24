@@ -240,7 +240,7 @@ export function Workbench() {
                               .reverse()
                               .slice(1)
                               .map((s) => (
-                                <option key={s} value={s.replace(/-(\d{2})-(\d{2})-(\d{3})Z$/, ":$1:$2.$3Z")}>
+                                <option key={s} value={s}>
                                   {formatDate(s.slice(0, 10))}
                                 </option>
                               ))}

@@ -73,12 +73,27 @@ export async function readSnapshot(slug: string, stamp?: string): Promise<Snapsh
   return readJson<Snapshot | null>(path.join(snapshotDir(slug), `${pick}.json`), null)
 }
 
-/** The newest snapshot at or before `iso` — how the "view date" control time-travels. */
-export async function readSnapshotAsOf(slug: string, iso: string): Promise<Snapshot | null> {
+/** File-name form of an instant: `2026-08-23T18:45:12.345Z` -> `2026-08-23T18-45-12-345Z`. */
+export function toStamp(iso: string): string {
+  return iso.replace(/[:.]/g, "-")
+}
+
+/**
+ * The newest snapshot at or before `at` — how the "view date" control time-travels.
+ *
+ * `at` may be a stamp, a full ISO instant, or a bare `YYYY-MM-DD`. All three are
+ * normalised into stamp space before comparing, because stamps and ISO strings
+ * do not sort against each other: `-` sorts below `:`, so a raw lexical compare
+ * of the two forms silently mis-orders snapshots taken on the same day.
+ */
+export async function readSnapshotAsOf(slug: string, at: string): Promise<Snapshot | null> {
   const stamps = await listSnapshotStamps(slug)
-  const eligible = stamps.filter((s) => s <= iso)
-  if (eligible.length === 0) return stamps.length ? readSnapshot(slug, stamps[0]) : null
-  return readSnapshot(slug, eligible[eligible.length - 1])
+  if (stamps.length === 0) return null
+  const cutoff = toStamp(at)
+  const eligible = stamps.filter((s) => s <= cutoff)
+  // Asking for a date before the first scan yields the earliest we have, so the
+  // view degrades to "the oldest thing we know" rather than to an empty map.
+  return readSnapshot(slug, eligible[eligible.length - 1] ?? stamps[0])
 }
 
 export async function writeSnapshot(snapshot: Snapshot): Promise<string> {

@@ -12,6 +12,13 @@ delta over time.**
 Built on TinyFish primitives, running live. Conditions are not a fixed menu:
 anything a user can name, the scanner resolves, finds sources for, and sweeps.
 
+**Documentation** · [Architecture](docs/ARCHITECTURE.md) — how it fits together
+· [The collection agent](docs/AGENT.md) — phases, escalation ladder, token
+economics · [Data model](docs/DATA-MODEL.md) — types, friction maths, storage
+· [HTTP API](docs/API.md) — routes and SSE event shapes
+· [Operations](docs/OPERATIONS.md) — setup, tuning, troubleshooting
+· [Decisions](docs/DECISIONS.md) — the calls we made and what they cost
+
 ---
 
 ## The angle: coverage status is a lie
@@ -171,28 +178,55 @@ validated on content, never on status.
 
 ## Running it
 
+**Prerequisites.** Node 20+, pnpm, a [TinyFish key](https://agent.tinyfish.ai/api-keys)
+and an [OpenRouter key](https://openrouter.ai/keys). Search and fetch are free;
+agent runs are metered.
+
 ```bash
 pnpm install
 cp .env.example .env.local     # add TINYFISH_API_KEY and OPENROUTER_API_KEY
-pnpm dev
+pnpm dev                       # http://localhost:3000
 ```
 
-Then name a condition in the header and press **Run scan**. The map repaints
-jurisdiction by jurisdiction as states land.
+Reading the atlas needs no keys at all — route handlers for reading touch only
+`data/`, so the committed snapshots load, compare and time-travel offline. Keys
+are needed to scan and to re-verify.
 
-The same orchestrator runs headless:
+**First run.** Name a condition in the header — "GLP-1 drugs for weight loss",
+"continuous glucose monitors", "ABA therapy for autism" — and press **Run scan**.
+Then:
+
+1. Watch the **plan** event before the fan-out: how many of the 51 jurisdictions
+   one shared tracker read settled, and how many need their own subagent. That
+   ratio is the design working.
+2. Watch the map repaint state by state as records land.
+3. Read the **ledger** at the end: actual prompt tokens against the naive
+   whole-document-per-state counterfactual.
+
+Then the parts worth looking at: **switch the map from status to friction** and
+watch the country redraw; **open a state** for its friction ledger, verbatim
+criteria, source link and a live **Check again now**; **compare two states with
+the same status** side by side; and **re-scan later** — the second snapshot is
+what turns the change feed from *reported* into *observed*.
+
+**Headless.** The same orchestrator, no browser. This is how the committed seed
+data was produced.
 
 ```bash
 pnpm scan "GLP-1 drugs for weight loss"
 pnpm scan "continuous glucose monitors" --depth deep --agent-budget 10
-pnpm scan glp1_obesity --depth baseline   # cheapest re-scan of a saved condition
-pnpm agent:list                            # saved conditions, snapshots, change counts
-pnpm agent:ledger                          # cost history
+pnpm scan obesity_glp_1_receptor_agonists --depth baseline   # cheap re-scan of a saved condition
+pnpm agent:list                                              # saved conditions, snapshots, change counts
+pnpm agent:ledger                                            # cost history
 ```
 
-Scan depths: `baseline` reads trackers only (seconds, near-free, thinner
-criteria); `standard` fans out to whatever the trackers left thin; `deep` gives
-every one of the 51 jurisdictions its own subagent.
+| Depth | Fans out | Roughly | Good for |
+|---|---|---|---|
+| `baseline` | nothing | seconds | Refreshing a condition whose trackers are current |
+| `standard` | states the baseline left thin | 1–3 min | The normal scan |
+| `deep` | all 51 | 5–10 min | Best verbatim coverage, most spend |
+
+Full setup, tuning and troubleshooting: [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ## Layout
 
@@ -215,6 +249,7 @@ agent/
 app/api/                atlas · changes · conditions · scan (SSE) · verify (SSE)
 components/coverage-atlas/
 data/                   snapshots, change feeds, run ledger — committed
+docs/                   architecture · agent · data model · API · operations · decisions
 ```
 
 ## Scope
